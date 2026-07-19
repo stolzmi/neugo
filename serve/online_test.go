@@ -335,3 +335,54 @@ func TestStartOnlineRequiresConfig(t *testing.T) {
 		t.Fatalf("Expected error when Holdout is nil")
 	}
 }
+
+func TestFeedbackDropsWhenChannelFull(t *testing.T) {
+	model := xorModel(t)
+	holdout := xorHoldout()
+
+	cfg := Config{
+		InputDim: 2,
+		Loss:     train.BCELoss(),
+		Holdout:  holdout,
+	}
+
+	s, err := New(model, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
+
+	// Replace feedback channel with small capacity (2) so we can fill it with 3 requests
+	s.feedback = make(chan Sample, 2)
+
+	handler := s.Handler()
+
+	// Post 3 feedback requests; first 2 should succeed, 3rd should be dropped
+	for i := 0; i < 3; i++ {
+		body := map[string]interface{}{
+			"x": []float32{0.5, 0.5},
+			"y": []float32{0.5},
+		}
+		bodyBytes, _ := json.Marshal(body)
+
+		req := httptest.NewRequest("POST", "/feedback", bytes.NewReader(bodyBytes))
+		w := httptest.NewRecorder()
+
+		handler.ServeHTTP(w, req)
+
+		// All requests should return 202 (non-blocking send never blocks caller)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("Request %d: expected 202 Accepted, got %d", i+1, w.Code)
+		}
+	}
+
+	// After 3 requests to a channel with capacity 2:
+	// - feedbackTotal should be 2 (only successful sends increment it)
+	// - feedbackDropped should be 1 (1 send went to default branch)
+	if s.metrics.feedbackTotal.Load() != 2 {
+		t.Fatalf("Expected feedbackTotal 2, got %d", s.metrics.feedbackTotal.Load())
+	}
+
+	if s.metrics.feedbackDropped.Load() != 1 {
+		t.Fatalf("Expected feedbackDropped 1, got %d", s.metrics.feedbackDropped.Load())
+	}
+}

@@ -195,7 +195,6 @@ func (s *Server) onlineTrainer(ctx context.Context) {
 		case sample := <-s.feedback:
 			rb.Push(sample)
 			count++
-			s.metrics.feedbackTotal.Add(1)
 
 			// Check if we should retrain
 			if count >= s.cfg.RetrainEvery {
