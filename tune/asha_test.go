@@ -8,7 +8,7 @@ import (
 
 func TestRungPromotionMath(t *testing.T) {
 	// Unit test on the asha struct: rung already holds {1..9}, η=3:
-	// decide(1.5) → promote (top third); decide(8.0) → prune. Minimize direction.
+	// decide(1.5) → promote (ties promote); decide(8.0) → prune. Minimize direction.
 	a := &asha{
 		cfg: &ASHAConfig{
 			MinResource:     1,
@@ -24,17 +24,19 @@ func TestRungPromotionMath(t *testing.T) {
 	a.rungs[resource] = []float64{1, 2, 3, 4, 5, 6, 7, 8, 9}
 
 	// decide(1.5) with {1..9} and η=3:
-	// n=9, ceil(9/3)=3 best values = {1,2,3}
-	// 1.5 should be promoted (within top 3)
-	shouldPrune := a.decide(false, append(a.rungs[resource], 1.5))
+	// n=10, ceil(10/3)=4 keepCount
+	// strictlyBetter = count of v < 1.5 = 1 (only 1)
+	// 1 >= 4? No → promote
+	shouldPrune := a.decide(append(a.rungs[resource], 1.5))
 	if shouldPrune {
 		t.Errorf("decide(1.5) with {1..9} should promote, got prune")
 	}
 
 	// decide(8.0) with {1..9,1.5} and η=3:
-	// n=10, ceil(10/3)=4 best values = {1,1.5,2,3}
-	// 8.0 is not in top 4, so should prune
-	shouldPrune = a.decide(false, append(a.rungs[resource], 1.5, 8.0))
+	// n=11, ceil(11/3)=4 keepCount
+	// strictlyBetter = count of v < 8.0 = 10 (all except 8.0)
+	// 10 >= 4? Yes → prune
+	shouldPrune = a.decide(append(a.rungs[resource], 1.5, 8.0))
 	if !shouldPrune {
 		t.Errorf("decide(8.0) with {1..9,1.5} should prune, got promote")
 	}
@@ -105,7 +107,8 @@ func TestNoASHAConfigNeverPrunes(t *testing.T) {
 
 func TestAshaPrunesBadTrialsAndSavesWork(t *testing.T) {
 	// Space: Float("x", -1, 1). Objective simulates 81 epochs:
-	//   good (x>0): loss = 1/float64(epoch); bad (x<=0): loss = 10.
+	//   good (x>0): loss = (1/epoch) * (1.0 + 0.05*(1.0-x)), x-dependent and distinct;
+	//   bad (x<=0): loss = 10.0
 	//   Reports every epoch, honors ShouldPrune (returns early).
 	// ASHA{1, 81, 3}, 100 trials, seed 7. Assert:
 	//   Best().Value < 0.1; ≥30% of bad-x trials Pruned;
@@ -122,7 +125,8 @@ func TestAshaPrunesBadTrialsAndSavesWork(t *testing.T) {
 			atomic.AddInt64(&epochsExecuted, 1)
 
 			if x > 0 {
-				loss = 1.0 / float64(epoch)
+				// Distinct, x-dependent loss for good trials; lower x → higher loss, best x→1 gives lowest
+				loss = (1.0 / float64(epoch)) * (1.0 + 0.05*(1.0-x))
 			} else {
 				loss = 10.0
 			}

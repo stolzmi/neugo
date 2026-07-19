@@ -2,12 +2,23 @@ package tune
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"runtime"
 	"sort"
 	"sync"
 	"time"
 )
+
+// ASHAConfigError reports an invalid ASHA configuration.
+type ASHAConfigError struct {
+	Field   string
+	Message string
+}
+
+func (e *ASHAConfigError) Error() string {
+	return fmt.Sprintf("invalid ASHA config: %s %s", e.Field, e.Message)
+}
 
 // Trial represents a single trial in the search.
 type Trial struct {
@@ -49,11 +60,14 @@ func (t *Trial) ShouldPrune() bool {
 // Lower scores are better by default; cfg.Maximize reverses this.
 type Objective func(t *Trial) (float64, error)
 
-// ASHAConfig is a placeholder for ASHA pruning (Task 12).
+// ASHAConfig specifies parameters for Asynchronous Successive Halving Algorithm (ASHA) pruning.
+// MinResource is the starting resource level (must be > 0).
+// MaxResource is the maximum resource level (must be >= MinResource).
+// ReductionFactor is η, the number by which to reduce the cohort at each rung (default 3 if <= 1).
 type ASHAConfig struct {
-	MinResource     int
-	MaxResource     int
-	ReductionFactor int
+	MinResource     int // Starting resource level (e.g., epochs); must be > 0
+	MaxResource     int // Maximum resource level; must be >= MinResource
+	ReductionFactor int // Reduction factor η (default 3 if <= 1)
 }
 
 // Config specifies the tuning configuration.
@@ -70,6 +84,16 @@ type Config struct {
 func Run(ctx context.Context, space *Space, obj Objective, cfg Config) (*Results, error) {
 	if cfg.Workers <= 0 {
 		cfg.Workers = runtime.NumCPU()
+	}
+
+	// Validate ASHA config if provided
+	if cfg.ASHA != nil {
+		if cfg.ASHA.MinResource <= 0 {
+			return nil, &ASHAConfigError{Field: "MinResource", Message: "must be positive"}
+		}
+		if cfg.ASHA.MaxResource < cfg.ASHA.MinResource {
+			return nil, &ASHAConfigError{Field: "MaxResource", Message: "must be >= MinResource"}
+		}
 	}
 
 	// Create shared ASHA instance if configured (Task 12).

@@ -225,3 +225,67 @@ func TestMaximize(t *testing.T) {
 		t.Errorf("Best x %.6f not close to 3 (diff %.6f >= 0.25)", x, math.Abs(x-3))
 	}
 }
+
+func TestRunRejectsInvalidASHAConfig(t *testing.T) {
+	space := NewSpace().Float("x", 0, 1)
+	obj := func(trial *Trial) (float64, error) {
+		return trial.Params.Float("x"), nil
+	}
+
+	// Test 1: MinResource <= 0 should be rejected
+	cfg := Config{
+		Trials:  10,
+		Workers: 2,
+		Seed:    42,
+		ASHA: &ASHAConfig{
+			MinResource:     0, // invalid: <= 0
+			MaxResource:     81,
+			ReductionFactor: 3,
+		},
+	}
+	results, err := Run(context.Background(), space, obj, cfg)
+	if err == nil {
+		t.Errorf("Run should reject MinResource <= 0, got nil error")
+	}
+	if results != nil {
+		t.Errorf("Run should return nil results on invalid config, got %v", results)
+	}
+
+	// Test 2: MaxResource < MinResource should be rejected
+	cfg = Config{
+		Trials:  10,
+		Workers: 2,
+		Seed:    42,
+		ASHA: &ASHAConfig{
+			MinResource:     81, // MinResource > MaxResource
+			MaxResource:     27, // invalid
+			ReductionFactor: 3,
+		},
+	}
+	results, err = Run(context.Background(), space, obj, cfg)
+	if err == nil {
+		t.Errorf("Run should reject MaxResource < MinResource, got nil error")
+	}
+	if results != nil {
+		t.Errorf("Run should return nil results on invalid config, got %v", results)
+	}
+
+	// Test 3: Negative MinResource should be rejected
+	cfg = Config{
+		Trials:  10,
+		Workers: 2,
+		Seed:    42,
+		ASHA: &ASHAConfig{
+			MinResource:     -1, // invalid: negative
+			MaxResource:     81,
+			ReductionFactor: 3,
+		},
+	}
+	results, err = Run(context.Background(), space, obj, cfg)
+	if err == nil {
+		t.Errorf("Run should reject negative MinResource, got nil error")
+	}
+	if results != nil {
+		t.Errorf("Run should return nil results on invalid config, got %v", results)
+	}
+}

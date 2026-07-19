@@ -61,10 +61,10 @@ func (a *asha) isRung(resource int) bool {
 
 // decide makes a promotion decision for the last value in the values slice.
 // Returns true if the trial should be pruned, false if promoted.
-// Decision: promoted iff the last value is within the best ceil(n/η) of all values,
-// where direction is determined by the maximize flag.
+// Decision: promoted iff fewer than keepCount values are strictly better than the candidate.
+// Ties at the cutoff promote (async ASHA errs toward promotion, deterministic, no arrival-order dependence).
 // With n < η observations, promotes by default (async ASHA).
-func (a *asha) decide(maximize bool, values []float64) bool {
+func (a *asha) decide(values []float64) bool {
 	n := len(values)
 	if n == 0 {
 		return false
@@ -77,33 +77,30 @@ func (a *asha) decide(maximize bool, values []float64) bool {
 		return false
 	}
 
-	// Find the threshold: the ceil(n/η)-th best value (1-indexed becomes 0-indexed)
+	// Find the threshold: the ceil(n/η)-th best value
 	keepCount := int(math.Ceil(float64(n) / float64(eta)))
-	if keepCount > n {
-		keepCount = n
-	}
 
 	newValue := values[n-1]
 
-	// Count how many values are at least as good as newValue (including ties)
-	betterOrEqual := 0
-	if maximize {
+	// Count how many values are strictly better than newValue (direction per a.maximize)
+	strictlyBetter := 0
+	if a.maximize {
 		for _, v := range values {
-			if v >= newValue {
-				betterOrEqual++
+			if v > newValue {
+				strictlyBetter++
 			}
 		}
 	} else {
 		for _, v := range values {
-			if v <= newValue {
-				betterOrEqual++
+			if v < newValue {
+				strictlyBetter++
 			}
 		}
 	}
 
-	// Prune if the value is NOT in the top keepCount
-	// i.e., if more than keepCount values are at least as good
-	return betterOrEqual > keepCount
+	// Promote iff strictly fewer than keepCount values are better than newValue
+	// Ties at the cutoff promote (no arrival-order dependence)
+	return strictlyBetter >= keepCount
 }
 
 // report records a value at a resource and decides whether to prune.
@@ -123,5 +120,5 @@ func (a *asha) report(resource int, value float64) bool {
 	values := a.rungs[resource]
 
 	// Decide promotion using stored maximize flag
-	return a.decide(a.maximize, values)
+	return a.decide(values)
 }
