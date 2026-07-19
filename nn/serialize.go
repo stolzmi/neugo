@@ -107,14 +107,19 @@ func encodeModule(m Module) (moduleDoc, error) {
 	}
 }
 
+// encodeRoot validates model and encodes it to a moduleDoc.
+func encodeRoot(model *SequentialModel, prefix string) (moduleDoc, error) {
+	if model == nil {
+		return moduleDoc{}, fmt.Errorf("nn: %s: model is nil", prefix)
+	}
+	return encodeModule(model)
+}
+
 // Save writes model as a JSON document — a tree of {type, config, params,
 // modules} nodes readable by Load. RNG seed and optimizer state are never
 // included (training-resume is out of scope).
 func Save(model *SequentialModel, path string) error {
-	if model == nil {
-		return fmt.Errorf("nn: Save: model is nil")
-	}
-	doc, err := encodeModule(model)
+	doc, err := encodeRoot(model, "Save")
 	if err != nil {
 		return err
 	}
@@ -293,6 +298,23 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 	}
 }
 
+// decodeRoot parses JSON and reconstructs the model tree.
+func decodeRoot(data []byte, prefix string) (*SequentialModel, error) {
+	var doc moduleDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("nn: %s: %w", prefix, err)
+	}
+	m, err := decodeModule(doc, NewRNG(0))
+	if err != nil {
+		return nil, err
+	}
+	seq, ok := m.(*SequentialModel)
+	if !ok {
+		return nil, fmt.Errorf("nn: %s: root module has type %q, want \"sequential\"", prefix, doc.Type)
+	}
+	return seq, nil
+}
+
 // Load reads a JSON document written by Save and reconstructs the module
 // tree with its trained weights. The weight-init RNG passed to
 // constructors during reconstruction is never actually used for
@@ -303,28 +325,13 @@ func Load(path string) (*SequentialModel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nn: Load: %w", err)
 	}
-	var doc moduleDoc
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, fmt.Errorf("nn: Load: %w", err)
-	}
-	m, err := decodeModule(doc, NewRNG(0))
-	if err != nil {
-		return nil, err
-	}
-	seq, ok := m.(*SequentialModel)
-	if !ok {
-		return nil, fmt.Errorf("nn: Load: root module has type %q, want \"sequential\"", doc.Type)
-	}
-	return seq, nil
+	return decodeRoot(data, "Load")
 }
 
 // Marshal encodes a model as JSON bytes (non-indented).
 // The output can be decoded by Unmarshal.
 func Marshal(model *SequentialModel) ([]byte, error) {
-	if model == nil {
-		return nil, fmt.Errorf("nn: Marshal: model is nil")
-	}
-	doc, err := encodeModule(model)
+	doc, err := encodeRoot(model, "Marshal")
 	if err != nil {
 		return nil, err
 	}
@@ -334,19 +341,7 @@ func Marshal(model *SequentialModel) ([]byte, error) {
 // Unmarshal decodes JSON bytes into a SequentialModel.
 // The root module must be of type "sequential".
 func Unmarshal(data []byte) (*SequentialModel, error) {
-	var doc moduleDoc
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, fmt.Errorf("nn: Unmarshal: %w", err)
-	}
-	m, err := decodeModule(doc, NewRNG(0))
-	if err != nil {
-		return nil, err
-	}
-	seq, ok := m.(*SequentialModel)
-	if !ok {
-		return nil, fmt.Errorf("nn: Unmarshal: root module has type %q, want \"sequential\"", doc.Type)
-	}
-	return seq, nil
+	return decodeRoot(data, "Unmarshal")
 }
 
 // Clone creates a fully independent deep copy of a model by marshaling
