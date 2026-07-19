@@ -39,10 +39,11 @@ type modelVersion struct {
 // Server is a lock-free HTTP server for model inference.
 // swapMu guards swapIn only — the predict path is lock-free and must NOT touch it.
 type Server struct {
-	current *atomic.Pointer[modelVersion]
-	cfg     Config
-	metrics *metrics
-	swapMu  sync.Mutex // guards swapIn only; serializes model swaps to keep generations unique
+	current  *atomic.Pointer[modelVersion]
+	cfg      Config
+	metrics  *metrics
+	swapMu   sync.Mutex // guards swapIn only; serializes model swaps to keep generations unique
+	feedback chan Sample // buffered channel for online learning feedback
 }
 
 // New creates a new Server from a model and config.
@@ -90,9 +91,10 @@ func New(model *nn.SequentialModel, cfg Config) (*Server, error) {
 	ptr.Store(ver)
 
 	return &Server{
-		current: ptr,
-		cfg:     cfg,
-		metrics: &metrics{},
+		current:  ptr,
+		cfg:      cfg,
+		metrics:  &metrics{},
+		feedback: make(chan Sample, 4096),
 	}, nil
 }
 
@@ -101,6 +103,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /predict", s.handlePredict)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("POST /feedback", s.handleFeedback)
 	return mux
 }
 
@@ -220,4 +223,54 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"model_gen": gen,
 	})
+}
+
+// handleFeedback handles POST /feedback requests.
+// Validates X and Y lengths, then non-blocking send to the feedback channel.
+func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		X []float32 `json:"x"`
+		Y []float32 `json:"y"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("invalid JSON: %v", err)})
+		return
+	}
+
+	// Validate X length
+	if len(req.X) != s.cfg.InputDim {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("X length %d does not match InputDim %d", len(req.X), s.cfg.InputDim)})
+		return
+	}
+
+	// Validate Y length (if holdout is set, use its Y dimension)
+	if s.cfg.Holdout != nil && len(s.cfg.Holdout) > 0 {
+		expectedYLen := len(s.cfg.Holdout[0].Y)
+		if len(req.Y) != expectedYLen {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Y length %d does not match holdout Y length %d", len(req.Y), expectedYLen)})
+			return
+		}
+	}
+
+	sample := Sample{X: req.X, Y: req.Y}
+
+	// Non-blocking send: if channel is full, drop and increment feedbackDropped
+	select {
+	case s.feedback <- sample:
+		// Successfully sent
+		s.metrics.feedbackTotal.Add(1)
+	default:
+		// Channel full, drop the sample
+		s.metrics.feedbackDropped.Add(1)
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
