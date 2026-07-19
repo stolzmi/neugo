@@ -83,6 +83,60 @@ them with `go run ./examples/<name>`.
 - **`data`**: CSV loading, z-score/min-max normalization, train/val/test
   splitting, class balancing (oversample/undersample), MNIST-style and
   CIFAR-10 image loaders — all with explicit `*rand.Rand`, no global state.
+- **Export** (`export`): Convert trained models to standalone Go source code
+  with zero dependencies. Single-file inference functions work anywhere Go
+  runs — native, WASM, TinyGo. Bit-exact parity with training engine.
+  See [`docs/EXPORT_GUIDE.md`](docs/EXPORT_GUIDE.md).
+- **Serve** (`serve`): Hot-swap model serving with online learning. Stateless
+  HTTP API, Prometheus metrics, holdout gate for validation, automatic rollback.
+  See `examples/serve_xor` for a canonical walkthrough.
+- **Tune** (`tune`): Parallel hyperparameter search with ASHA early stopping.
+  Supports log-uniform floats, integers, and categorical choices. Runs trials
+  in worker pools across all CPUs. See [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md).
+
+## Export Example
+
+Train and save a model, then export it to standalone Go:
+
+```bash
+go run ./cmd/neugo export -model trained.json -out model_gen.go -pkg model
+```
+
+Use the generated function in any Go project:
+
+```go
+predictions := model.Predict([]float32{0.1, 0.2, ...})
+```
+
+The generated code has no external imports and compiles to any platform Go
+supports (native binary, WASM, ARM64, etc.).
+
+## Serve Example
+
+Create a server with online learning:
+
+```go
+server, _ := serve.New(model, serve.Config{
+    InputDim: 2, Loss: train.BCELoss(), Holdout: holdout,
+})
+server.StartOnline(ctx)
+server.ListenAndServe(":8080")  // Hot-swap, Prometheus metrics, rollback
+```
+
+See `examples/serve_xor` for a full walkthrough with curl commands.
+
+## Tune Example
+
+Search for optimal hyperparameters with ASHA:
+
+```go
+space := tune.NewSpace().LogFloat("lr", 1e-4, 0.5).Int("hidden", 4, 64)
+results, _ := tune.Run(ctx, space, func(trial *tune.Trial) (float64, error) {
+    return trainModel(trial.Params.Float("lr"), trial.Params.Int("hidden")), nil
+}, tune.Config{Trials: 60, Workers: 4, ASHA: &tune.ASHAConfig{...}})
+```
+
+See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for details.
 
 ## Testing
 
