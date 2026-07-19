@@ -164,7 +164,7 @@ ASHA: &tune.ASHAConfig{
 }
 ```
 
-This creates 5 "rungs" of successive halving:
+This creates 3 "rungs" of successive halving:
 - **Rung 0** (2 epochs): All 60 trials run 2 epochs; bottom 75% (45 trials) pruned.
 - **Rung 1** (8 epochs): Remaining 15 trials run 6 more epochs (8 total); bottom 75% (11 trials) pruned.
 - **Rung 2** (32 epochs): Remaining 4 trials run to 32 epochs (24 more).
@@ -184,8 +184,8 @@ if err != nil {
 best := results.Best()
 fmt.Printf("Best loss: %.4f\n", best.Value)
 
-top10 := results.Top(10)
-fmt.Println(results.String())  // Pretty-printed table
+top := &tune.Results{Trials: results.Top(10)}
+fmt.Println(top.String())  // Pretty-printed table of top 10
 ```
 
 #### TrialResult
@@ -254,7 +254,7 @@ go run .
 Output:
 ```
 Best validation loss: 0.2139
-  Learning rate: 0.2751
+  Learning rate: 0.275105
   Hidden size: 46
   Activation: tanh
 

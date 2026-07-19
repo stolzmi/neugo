@@ -107,7 +107,6 @@ func main() {
 			_, err := trainer.Fit(
 				trainX, trainY,
 				train.Epochs(1), train.BatchSize(32), train.Shuffle(true), train.Seed(trial.Seed+int64(epoch)),
-				train.Validation(valX, valY),
 			)
 			if err != nil {
 				return 1.0, err
@@ -124,6 +123,9 @@ func main() {
 				bestValLoss = valLoss
 			}
 
+			// Increment total epochs counter (before pruning decision to count all completed epochs)
+			atomic.AddInt64(&totalEpochs, 1)
+
 			// Report to ASHA for pruning decision
 			trial.Report(epoch, valLoss)
 
@@ -131,9 +133,6 @@ func main() {
 			if trial.ShouldPrune() {
 				return bestValLoss, nil
 			}
-
-			// Increment total epochs counter
-			atomic.AddInt64(&totalEpochs, 1)
 		}
 
 		return bestValLoss, nil
@@ -165,7 +164,8 @@ func main() {
 
 	// Display results
 	fmt.Println("\n=== Top 10 Results ===")
-	fmt.Println(results.String())
+	top := &tune.Results{Trials: results.Top(10)}
+	fmt.Println(top.String())
 
 	best := results.Best()
 	if best.Err == nil {
