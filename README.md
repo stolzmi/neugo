@@ -3,7 +3,9 @@
 A zero-dependency neural network library for Go. Everything is a
 `Module` — dense layers, convolutions, pooling, dropout, batch norm, and
 activations all compose the same way, and one `Trainer` handles fitting,
-prediction, and evaluation for both.
+prediction, and evaluation for both. Trained models can be exported to
+standalone Go source, served over HTTP with hot-swap and online learning,
+and tuned with parallel hyperparameter search.
 
 ## Install
 
@@ -46,16 +48,24 @@ func main() {
 }
 ```
 
-Seven runnable examples live in `examples/`: `xor`, `wine_quality` (a real
-dataset, `dataset/wine_quality/winequality-red.csv`), `fashion_mnist`
-(convolutional; falls back to synthetic data unless you've downloaded a
-Fashion-MNIST CSV yourself), `cifar10_cnn` and `cifar100_cnn`
-(convolutional; each downloads and extracts the real dataset from
-`cs.toronto.edu` on first run — ~170MB/~160MB — training on a capped subset
-for speed, and falls back to synthetic data if the download fails, e.g. no
-network), `callbacks` (early stopping, checkpointing, LR scheduling,
-progress reporting), and `crossval` (k-fold cross-validation). Run any of
-them with `go run ./examples/<name>`.
+## Examples
+
+Nine runnable examples live in `examples/` — run any of them with
+`go run ./examples/<name>`:
+
+- `xor` — the Quickstart above, end to end.
+- `wine_quality` — a real dataset (`dataset/wine_quality/winequality-red.csv`).
+- `fashion_mnist` — convolutional; falls back to synthetic data unless
+  you've downloaded a Fashion-MNIST CSV yourself.
+- `cifar10_cnn` / `cifar100_cnn` — convolutional; each downloads and
+  extracts the real dataset from `cs.toronto.edu` on first run
+  (~170MB/~160MB), training on a capped subset for speed, and falls back
+  to synthetic data if the download fails (e.g. no network).
+- `callbacks` — early stopping, checkpointing, LR scheduling, progress
+  reporting.
+- `crossval` — k-fold cross-validation.
+- `serve_xor` — HTTP serving with hot-swap, metrics, and online learning.
+- `tune_wine` — hyperparameter search with ASHA pruning.
 
 ## Features
 
@@ -79,10 +89,12 @@ them with `go run ./examples/<name>`.
   `train.KFoldSplits`/`StratifiedKFoldSplits`/`CrossValidate` for
   cross-validation.
 - **Serialization**: `nn.Save`/`nn.Load` — one JSON format for any module
-  tree, dense or convolutional.
+  tree, dense or convolutional; `Marshal`/`Unmarshal`/`Clone` for
+  in-memory copies.
 - **`data`**: CSV loading, z-score/min-max normalization, train/val/test
   splitting, class balancing (oversample/undersample), MNIST-style and
-  CIFAR-10 image loaders — all with explicit `*rand.Rand`, no global state.
+  CIFAR-10/CIFAR-100 image loaders — all with explicit `*rand.Rand`, no
+  global state.
 - **Export** (`export`): Convert trained models to standalone Go source code
   with zero dependencies. Single-file inference functions work anywhere Go
   runs — native, WASM, TinyGo. Bit-exact parity with training engine.
@@ -138,6 +150,18 @@ results, _ := tune.Run(ctx, space, func(trial *tune.Trial) (float64, error) {
 
 See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for details.
 
+## Layout
+
+    nn/       modules, tensors, initializers, serialization
+    train/    trainer, optimizers, losses, callbacks, schedulers, cross-validation
+    data/     CSV/image loading, normalization, splitting, balancing
+    export/   model JSON -> dependency-free Go inference source
+    serve/    HTTP serving: hot-swap, metrics, online learning, rollback
+    tune/     search spaces, worker-pool random search, ASHA pruning
+    cmd/neugo CLI (currently: export)
+    examples/ runnable demos (see above)
+    docs/     full guides
+
 ## Testing
 
     go build ./...
@@ -146,7 +170,9 @@ See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for deta
 
 ## Documentation
 
-See [`docs/GUIDE.md`](docs/GUIDE.md) for a full API walkthrough.
+- [`docs/GUIDE.md`](docs/GUIDE.md) — full API walkthrough.
+- [`docs/EXPORT_GUIDE.md`](docs/EXPORT_GUIDE.md) — exporting models to Go source.
+- [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) — hyperparameter tuning and ASHA.
 
 ## Design
 
