@@ -53,12 +53,12 @@ func main() {
 	}
 
 	cfg := serve.Config{
-		InputDim:   2,
-		Loss:       train.BCELoss(),
-		Holdout:    holdoutSamples,
-		BufferSize: 256,
+		InputDim:     2,
+		Loss:         train.BCELoss(),
+		Holdout:      holdoutSamples,
+		BufferSize:   256,
 		RetrainEvery: 16,
-		Epochs: 5,
+		Epochs:       5,
 		LearningRate: 0.05,
 	}
 

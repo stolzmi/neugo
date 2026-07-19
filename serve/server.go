@@ -19,14 +19,14 @@ type Sample struct {
 
 // Config configures a Server.
 type Config struct {
-	InputDim           int          // required; length every input must have
-	Loss               train.Loss   // required for online learning (Task 8); nil = serve-only
-	Holdout            []Sample     // required for online learning; nil = serve-only
-	BufferSize         int          // ring buffer capacity, default 1024
-	RetrainEvery       int          // retrain after N feedback samples, default 256
-	Epochs             int          // per retrain, default 5
-	LearningRate       float32      // default 0.05
-	MaxValLossIncrease float32      // gate slack, default 0 (candidate must be at least as good)
+	InputDim           int        // required; length every input must have
+	Loss               train.Loss // required for online learning (Task 8); nil = serve-only
+	Holdout            []Sample   // required for online learning; nil = serve-only
+	BufferSize         int        // ring buffer capacity, default 1024
+	RetrainEvery       int        // retrain after N feedback samples, default 256
+	Epochs             int        // per retrain, default 5
+	LearningRate       float32    // default 0.05
+	MaxValLossIncrease float32    // gate slack, default 0 (candidate must be at least as good)
 }
 
 // modelVersion represents a generation of the model with a pool of clones.
@@ -39,12 +39,12 @@ type modelVersion struct {
 // Server is a lock-free HTTP server for model inference.
 // swapMu guards swapIn and Rollback only — the predict path is lock-free and must NOT touch it.
 type Server struct {
-	current   *atomic.Pointer[modelVersion]
-	previous  *atomic.Pointer[modelVersion]
-	cfg       Config
-	metrics   *metrics
-	swapMu    sync.Mutex // guards swapIn and Rollback only; serializes model swaps to keep generations unique
-	feedback  chan Sample // buffered channel for online learning feedback
+	current  *atomic.Pointer[modelVersion]
+	previous *atomic.Pointer[modelVersion]
+	cfg      Config
+	metrics  *metrics
+	swapMu   sync.Mutex  // guards swapIn and Rollback only; serializes model swaps to keep generations unique
+	feedback chan Sample // buffered channel for online learning feedback
 }
 
 // New creates a new Server from a model and config.
@@ -95,11 +95,11 @@ func New(model *nn.SequentialModel, cfg Config) (*Server, error) {
 	prevPtr.Store(nil) // no previous version initially
 
 	return &Server{
-		current:   ptr,
-		previous:  prevPtr,
-		cfg:       cfg,
-		metrics:   &metrics{},
-		feedback:  make(chan Sample, 4096),
+		current:  ptr,
+		previous: prevPtr,
+		cfg:      cfg,
+		metrics:  &metrics{},
+		feedback: make(chan Sample, 4096),
 	}, nil
 }
 
