@@ -1,266 +1,186 @@
-# Export / Serve / Tune Implementation Plan
+# Export / Serve / Tune Implementation Plan (v2 — flax-restructure base)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship neugo's three differentiating features: (1) `neugo export` — compile a trained model to a dependency-free Go source file that cross-compiles anywhere (native, WASM, TinyGo); (2) `serve` — in-process model serving with online learning and atomic hot weight swap; (3) `tune` — goroutine-parallel hyperparameter search with ASHA early stopping.
+**Goal:** Ship neugo's three differentiating features: (1) `export` — compile a trained model to a dependency-free Go source file that cross-compiles anywhere (native, WASM, TinyGo) plus a `neugo export` CLI; (2) `serve` — in-process model serving with online learning and atomic hot weight swap; (3) `tune` — goroutine-parallel hyperparameter search with ASHA early stopping.
 
-**Architecture:** All three features sit *on top of* the existing `Network` package and its `ModelConfig` JSON format — no changes to training internals. A small Part 0 adds the two missing primitives everything else needs: `Predict` (inference that returns outputs) and model cloning (`ForwardPass` mutates neuron state, so concurrency requires clones). Export is a code generator consuming `ModelConfig`; Serve wraps a `Network` behind `atomic.Pointer` + `sync.Pool` of inference clones; Tune is a worker pool that owns nothing of the model — it just calls a user objective.
+**Architecture:** v2 targets the flax-restructure codebase: packages `nn` (Module interface, `SequentialModel`, `Tensor{Data []float32, Shape []int}`, JSON `Save`/`Load` of a `{type, config, params, modules}` module tree) and `train` (`Trainer` with `New(model, opt, loss)`, `Fit`, `Predict`, `Evaluate`; `Loss` interface; `Optimizer` with `SGD(lr)`; `Metrics{Loss, Accuracy, ...}`). Task 1 adds the missing primitives (`nn.Marshal`/`nn.Unmarshal`/`nn.Clone`); export is a code generator consuming the saved model JSON directly (its own decoder — no dependency on `nn` internals); serve wraps a model behind `atomic.Pointer` + `sync.Pool` of clones (required: `LinearLayer.Forward` caches `l.input` even in Inference mode, so a shared model races under concurrent requests); tune is model-agnostic.
 
-**Tech Stack:** Go 1.25 stdlib only. No external dependencies anywhere in this plan (that is a feature headline: `go get neugo` pulls nothing else).
+**Tech Stack:** Go 1.25 stdlib only. No external dependencies anywhere.
 
 ## Global Constraints
 
-- Module path is `neugo`; existing package names (`Network`, `tensor`, `data`) stay as-is. New packages use standard lowercase names: `export`, `serve`, `tune`, `cmd/neugo`.
+- Module path is `neugo`; existing packages `nn`, `train`, `data` stay as-is. New packages: `export`, `serve`, `tune`, `cmd/neugo`.
 - Stdlib only. No third-party imports in any new file.
-- All numerics are `float32` to match the engine (tune's search space uses `float64` for param math only).
+- Model numerics are `float32` (tune's param math may use `float64`).
 - Generated code (export) must build with `GOOS=js GOARCH=wasm` and TinyGo: no reflection, no maps, no goroutines, imports at most `math`.
-- Every task follows TDD: failing test → implement → pass → commit. Run tests with `go test ./<pkg>/ -run <Name> -v` from the repo root.
-- Known engine quirk to respect: `Softmax` is applied element-wise by `Network.ForwardPass` (scalar `Apply`), which is not true vector softmax. Export parity tests therefore use Sigmoid/ReLU/Tanh/Linear models only; generated code emits *correct* vector softmax and documents the divergence.
+- Generated code must reproduce the engine's outputs **exactly** (same float32 ops in the same order as the `nn` forward passes; weight literals emitted as hex floats). Parity tests assert `==`, not epsilon.
+- TDD per task: failing test → implement → pass → commit. Run from repo root: `go test ./<pkg>/ -v` (add `-race` for `serve` and `tune`).
+- Examples follow the existing convention: one directory per example, `examples/<name>/main.go`.
 
-## Independently shippable parts
+## Task ordering
 
-Parts 1, 2, 3 are independent of each other (all depend only on Part 0). They can be executed in any order or by parallel workers after Part 0 lands. **Not in this plan:** the vectorized flat-slice core rewrite. It is a pure-performance optimization behind the same APIs and gets its own plan later; nothing here blocks on it.
+Task 1 blocks Tasks 6–9 (serve). Tasks 2–5 (export) depend only on the existing `nn` JSON format. Tasks 10–13 (tune) are independent of everything. Task 14 is final integration. **Not in this plan:** performance work (vectorized/blocked matmul) — separate plan later.
 
 ---
 
-# Part 0 — Core primitives (`Predict`, cloning)
-
-### Task 0.1: `Predict` and `PredictBatch` on Network
+### Task 1: `nn.Marshal` / `nn.Unmarshal` / `nn.Clone`
 
 **Files:**
-- Create: `Network/predict.go`
-- Test: `Network/predict_test.go`
+- Modify: `nn/serialize.go` (refactor `Save`/`Load` to delegate; do not change their behavior)
+- Test: `nn/serialize_clone_test.go` (new file)
 
 **Interfaces:**
-- Consumes: `Network.ForwardPass([]float32)`, `Layer.RegularSize()`, `layer.neurons[i].Activation()` (all exist).
-- Produces: `func (network *Network) Predict(input []float32) []float32` and `func (network *Network) PredictBatch(inputs [][]float32) [][]float32`. Every later part calls these — exact names matter.
+- Consumes: private `encodeModule`/`decodeModule` in `nn/serialize.go`, `NewRNG` (`nn/rng.go`).
+- Produces (serve depends on these exact signatures):
+  - `func Marshal(model *SequentialModel) ([]byte, error)` — the same JSON `Save` writes (indentation may differ; use non-indented `json.Marshal`).
+  - `func Unmarshal(data []byte) (*SequentialModel, error)` — same semantics as `Load` minus file I/O (including the root-must-be-sequential check; use `NewRNG(0)` as the throwaway reconstruction RNG, as `Load` does).
+  - `func Clone(model *SequentialModel) (*SequentialModel, error)` — `Marshal` then `Unmarshal`: fully independent deep copy.
 
 - [ ] **Step 1: Write the failing test**
 
 ```go
-// Network/predict_test.go
-package Network
+// nn/serialize_clone_test.go
+package nn
 
-import "testing"
-
-func TestPredictReturnsOutputActivations(t *testing.T) {
-	net := QuickBinary(2, 4)
-	out := net.Predict([]float32{0.5, -0.5})
-	if len(out) != 1 {
-		t.Fatalf("want 1 output, got %d", len(out))
-	}
-	if out[0] < 0 || out[0] > 1 {
-		t.Fatalf("sigmoid output out of range: %f", out[0])
-	}
-	// Predict must equal ForwardPass + reading the output layer.
-	net.ForwardPass([]float32{0.5, -0.5})
-	outLayer := net.layers[len(net.layers)-1]
-	if got := outLayer.neurons[0].Activation(); got != out[0] {
-		t.Fatalf("Predict %f != ForwardPass output %f", out[0], got)
-	}
-}
-
-func TestPredictBatch(t *testing.T) {
-	net := QuickBinary(2, 4)
-	outs := net.PredictBatch([][]float32{{0, 0}, {1, 1}})
-	if len(outs) != 2 || len(outs[0]) != 1 {
-		t.Fatalf("unexpected shape: %v", outs)
-	}
-}
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `go test ./Network/ -run TestPredict -v`
-Expected: FAIL — `net.Predict undefined`
-
-- [ ] **Step 3: Implement**
-
-```go
-// Network/predict.go
-package Network
-
-// Predict runs a forward pass and returns a copy of the output layer's
-// regular-neuron activations. NOTE: mutates internal neuron state; not safe
-// for concurrent use on a shared Network — clone per goroutine (see clone.go).
-func (network *Network) Predict(input []float32) []float32 {
-	network.ForwardPass(input)
-	outLayer := network.layers[len(network.layers)-1]
-	out := make([]float32, outLayer.RegularSize())
-	for i := range out {
-		out[i] = outLayer.neurons[i].Activation()
-	}
-	return out
-}
-
-// PredictBatch runs Predict over each input sequentially.
-func (network *Network) PredictBatch(inputs [][]float32) [][]float32 {
-	outs := make([][]float32, len(inputs))
-	for i, in := range inputs {
-		outs[i] = network.Predict(in)
-	}
-	return outs
-}
-```
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `go test ./Network/ -run TestPredict -v`
-Expected: PASS (2 tests)
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add Network/predict.go Network/predict_test.go
-git commit -m "feat(Network): add Predict and PredictBatch"
-```
-
-### Task 0.2: Cloning — shared-weight readers and deep copies
-
-**Files:**
-- Create: `Network/clone.go`
-- Test: `Network/clone_test.go`
-
-**Interfaces:**
-- Consumes: `ToConfig()`, `NetworkFromConfig(ModelConfig)` (exist). Key facts: `NetworkFromConfig` *shares* the `Weights` slice with its config; `ForwardPass` writes only neuron activations, never weights; `BackPropagation`/training write weights.
-- Produces:
-  - `func (network *Network) CloneReader() Network` — private neuron state, **shared** weight storage. Safe for concurrent *inference* alongside other readers. Cheap (no weight copy).
-  - `func (network *Network) CloneDeep() Network` — fully independent copy incl. weights. Required before any training on a copy.
-  - `func DeepCopyConfig(c ModelConfig) ModelConfig` — deep-copies the weights tensor.
-
-- [ ] **Step 1: Write the failing test**
-
-```go
-// Network/clone_test.go
-package Network
-
-import "testing"
-
-func TestCloneReaderSharesWeightsPrivateNeurons(t *testing.T) {
-	net := QuickBinary(2, 4)
-	clone := net.CloneReader()
-	if &net.weights[0][0][0] != &clone.weights[0][0][0] {
-		t.Fatal("CloneReader must share weight storage")
-	}
-	// Same outputs, independent neuron state.
-	a := net.Predict([]float32{1, 0})
-	b := clone.Predict([]float32{1, 0})
-	if a[0] != b[0] {
-		t.Fatalf("reader clone diverged: %f vs %f", a[0], b[0])
-	}
-}
-
-func TestCloneDeepIsIndependent(t *testing.T) {
-	net := QuickBinary(2, 4)
-	before := net.Predict([]float32{1, 0})[0]
-	clone := net.CloneDeep()
-	// Train the clone; original must not move.
-	x := [][]float32{{0, 0}, {0, 1}, {1, 0}, {1, 1}}
-	y := [][]float32{{0}, {1}, {1}, {0}}
-	clone.QuickFit(x, y, 50, 0.5)
-	if got := net.Predict([]float32{1, 0})[0]; got != before {
-		t.Fatalf("training a deep clone mutated the original: %f -> %f", before, got)
-	}
-}
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `go test ./Network/ -run TestClone -v`
-Expected: FAIL — `CloneReader undefined`
-
-- [ ] **Step 3: Implement**
-
-```go
-// Network/clone.go
-package Network
-
-// DeepCopyConfig returns a config whose weight tensor is fully independent.
-func DeepCopyConfig(c ModelConfig) ModelConfig {
-	w := make([][][]float32, len(c.Weights))
-	for l := range c.Weights {
-		w[l] = make([][]float32, len(c.Weights[l]))
-		for j := range c.Weights[l] {
-			w[l][j] = append([]float32(nil), c.Weights[l][j]...)
-		}
-	}
-	out := c
-	out.Weights = w
-	out.Layers = append([]LayerConfig(nil), c.Layers...)
-	return out
-}
-
-// CloneReader returns a Network with its own neuron state but SHARED weight
-// storage. Concurrent inference across readers is safe because ForwardPass
-// only writes neuron activations. Never train a reader clone.
-func (network *Network) CloneReader() Network {
-	return NetworkFromConfig(network.ToConfig()) // ToConfig passes the live weights slice through
-}
-
-// CloneDeep returns a fully independent copy, safe to train.
-func (network *Network) CloneDeep() Network {
-	return NetworkFromConfig(DeepCopyConfig(network.ToConfig()))
-}
-```
-
-Note: this leans on the existing behavior that `ToConfig` puts `network.weights` (the live slice) into the config and `NetworkFromConfig` assigns it without copying. Add a comment in `serialization.go` at `ToConfig` marking that behavior as load-bearing:
-
-```go
-// NOTE: Weights is the live slice, not a copy. CloneReader (clone.go) depends on this.
-```
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `go test ./Network/ -run TestClone -v`
-Expected: PASS (2 tests)
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add Network/clone.go Network/clone_test.go Network/serialization.go
-git commit -m "feat(Network): add CloneReader/CloneDeep/DeepCopyConfig"
-```
-
----
-
-# Part 1 — `export`: model → dependency-free Go source
-
-Generated file layout (what `GenerateGo` emits — the contract for every task in this part):
-
-```go
-// Code generated by neugo export. DO NOT EDIT.
-package <pkg>
-
-import "math" // only if an emitted activation needs it
-
-var w0 = []float32{0x1.5p-03, ...} // flat row-major, one var per layer gap
-var w1 = []float32{...}
-
-var (
-	nnWeights = [][]float32{w0, w1}
-	nnCols    = []int{8, 1}  // destination layer sizes
-	nnAct     = []int{1, 0}  // ActivationType per destination layer
+import (
+	"bytes"
+	"testing"
 )
 
-// <Fn> runs inference. Input length must be <inSize>.
-func <Fn>(input []float32) []float32 { ...forward loop... }
+func testModel(t *testing.T) *SequentialModel {
+	t.Helper()
+	rng := NewRNG(7)
+	m, err := Sequential([]int{1, 3},
+		Linear(rng, 3, 4, nil), ReLU(),
+		Linear(rng, 4, 2, nil), Sigmoid(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
 
-func nnApplyAct(v []float32, kind int) { ...switch over used kinds only... }
+func forward1(t *testing.T, m *SequentialModel, in []float32) []float32 {
+	t.Helper()
+	x, err := NewTensorFromData(in, []int{1, len(in)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Forward(&Context{Mode: Inference}, x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out.Data
+}
+
+func TestMarshalUnmarshalRoundTrip(t *testing.T) {
+	m := testModel(t)
+	data, err := Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := Unmarshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := []float32{0.5, -1, 2}
+	a, b := forward1(t, m, in), forward1(t, m2, in)
+	if !bytes.Equal(float32Bytes(a), float32Bytes(b)) {
+		t.Fatalf("round-trip changed outputs: %v vs %v", a, b)
+	}
+}
+
+func TestCloneIsDeepAndIndependent(t *testing.T) {
+	m := testModel(t)
+	c, err := Clone(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := []float32{1, 1, 1}
+	before := forward1(t, m, in)
+	// Mutate every clone param; original outputs must not move.
+	for _, p := range c.Params() {
+		for i := range p.Value.Data {
+			p.Value.Data[i] += 100
+		}
+	}
+	after := forward1(t, m, in)
+	if !bytes.Equal(float32Bytes(before), float32Bytes(after)) {
+		t.Fatalf("mutating clone changed original: %v vs %v", before, after)
+	}
+}
+
+func TestUnmarshalRejectsNonSequentialRoot(t *testing.T) {
+	if _, err := Unmarshal([]byte(`{"type":"linear"}`)); err == nil {
+		t.Fatal("want error for non-sequential root")
+	}
+}
+
+func float32Bytes(v []float32) []byte {
+	b := make([]byte, 0, len(v)*4)
+	for _, x := range v {
+		u := math.Float32bits(x)
+		b = append(b, byte(u), byte(u>>8), byte(u>>16), byte(u>>24))
+	}
+	return b
+}
 ```
 
-Weight literals are emitted as **hex float literals** (`strconv.FormatFloat(float64(w), 'x', -1, 32)`) so the generated constants round-trip bit-exactly — parity with the source model is exact equality, not epsilon.
+(Add `"math"` to the imports.)
 
-Bias handling (from `network.go`): `Weights[l]` has `len(Weights[l]) == Layers[l].Size` rows when `l == 0` (input layer, no bias) and `Layers[l].Size + 1` rows when `l >= 1`; the extra last row is the bias row. The forward loop detects this per layer as `len(W) == len(cur)+1` at generation time and emits the bias add.
+- [ ] **Step 2: Run to verify failure** — `go test ./nn/ -run 'Marshal|Clone' -v` → FAIL: `Marshal` undefined.
+- [ ] **Step 3: Implement** in `nn/serialize.go`: `Marshal` = `encodeModule(model)` + `json.Marshal` (nil-model check like `Save`); `Unmarshal` = `json.Unmarshal` into `moduleDoc` + `decodeModule(doc, NewRNG(0))` + root-type check (move the shared logic out of `Save`/`Load` so it exists once; `Save`/`Load` keep their exact current behavior incl. indented file output and error prefixes); `Clone` = `Marshal`+`Unmarshal`.
+- [ ] **Step 4: Run to verify pass** — `go test ./nn/ -v` → all PASS (existing serialize tests must still pass).
+- [ ] **Step 5: Commit** — `git add nn/ && git commit -m "feat(nn): Marshal/Unmarshal/Clone for in-memory model copies"`
 
-### Task 1.1: `GenerateGo` codegen
+---
+
+### Task 2: `export.GenerateGo` codegen
 
 **Files:**
 - Create: `export/codegen.go`
 - Test: `export/codegen_test.go`
 
 **Interfaces:**
-- Consumes: `Network.ModelConfig` (`Layers []LayerConfig{Size, ActivationType}`, `Weights [][][]float32`).
-- Produces: `func GenerateGo(cfg Network.ModelConfig, opts Options) ([]byte, error)` and `type Options struct { Package string; FuncName string }` (defaults `"model"`, `"Predict"`). Output is `gofmt`-formatted source.
+- Consumes: the model JSON format written by `nn.Save`/`nn.Marshal` — a tree of `{"type", "config", "params", "modules"}` nodes (see `nn/serialize.go:10-53` for the exact schema and config field names). `export` defines its own decoder structs for this JSON; it must NOT import `nn` in `codegen.go` (the test file may).
+- Produces:
+  - `type Options struct { Package string; FuncName string }` (defaults `"model"`, `"Predict"`)
+  - `func GenerateGo(modelJSON []byte, opts Options) ([]byte, error)` — gofmt-formatted (`go/format.Source`) Go source.
+
+**Supported module types (v1):** `sequential` (root), `linear`, `relu`, `sigmoid`, `tanh`, `leaky_relu` (per-instance alpha from config), `gelu`, `softmax`, `dropout` (identity at inference — emit nothing). Any other type (`conv2d`, `maxpool2d`, `avgpool2d`, `flatten`, `batchnorm`, nested `sequential`) → `error` naming the unsupported type. Missing/malformed params (`W`, `B` absent, wrong lengths vs config) → error.
+
+**Generated file contract** (single sample, no batch dim):
+
+```go
+// Code generated by neugo export. DO NOT EDIT.
+package <pkg>
+
+import "math" // only if sigmoid/tanh/gelu/softmax present
+
+var w0 = []float32{<hex floats>} // linear W, row-major [in*out], layout W[i*out+o]
+var b0 = []float32{<hex floats>}
+
+// <Fn> runs inference. len(input) must be <first linear in_features>;
+// returns <last layer width> values.
+func <Fn>(input []float32) []float32 {
+	cur := input
+	cur = nnLinear(cur, w0, b0, <in>, <out>)
+	nnReLU(cur)
+	cur = nnLinear(cur, w1, b1, <in>, <out>)
+	nnSigmoid(cur)
+	return cur
+}
+
+func nnLinear(x, w, b []float32, in, out int) []float32 { ... }
+// plus one helper per activation actually used
+```
+
+**Exactness requirements** (Global Constraints bind here):
+- Weight/bias literals: `strconv.FormatFloat(float64(v), 'x', -1, 32)` (hex float, exact round-trip).
+- `nnLinear` must use the same accumulation order as `nn.LinearLayer.Forward` (`nn/linear.go:60-68`) specialized to batch=1: `sum := b[o]; for i { sum += x[i] * w[i*out+o] }`.
+- Each activation helper must copy the exact float32 arithmetic from `nn/activation.go` (relu/sigmoid/tanh/leaky_relu/gelu — same casts, same operation order; read the file, don't transcribe from memory). Softmax: copy the formula from `nn.SoftmaxModule.Forward` (`nn/activation.go:126-152`) specialized to one row (max-subtract, exp, normalize — same order).
+- Emit only the helpers actually used; import `math` only if a used helper needs it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -275,254 +195,119 @@ import (
 	"strings"
 	"testing"
 
-	"neugo/Network"
+	"neugo/nn"
 )
 
-func testConfig() Network.ModelConfig {
-	net := Network.QuickBinary(2, 3)
-	return net.ToConfig()
-}
-
-func TestGenerateGoProducesValidSource(t *testing.T) {
-	src, err := GenerateGo(testConfig(), Options{Package: "xormodel", FuncName: "Predict"})
+func modelJSON(t *testing.T, m *nn.SequentialModel) []byte {
+	t.Helper()
+	data, err := nn.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fset := token.NewFileSet()
-	if _, err := parser.ParseFile(fset, "gen.go", src, 0); err != nil {
+	return data
+}
+
+func TestGenerateGoProducesValidSource(t *testing.T) {
+	rng := nn.NewRNG(1)
+	m, err := nn.Sequential([]int{1, 2},
+		nn.Linear(rng, 2, 3, nil), nn.ReLU(),
+		nn.Linear(rng, 3, 1, nil), nn.Sigmoid(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := GenerateGo(modelJSON(t, m), Options{Package: "xormodel", FuncName: "Predict"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "gen.go", src, 0); err != nil {
 		t.Fatalf("generated code does not parse: %v\n%s", err, src)
 	}
 	if _, err := format.Source(src); err != nil {
-		t.Fatalf("generated code not gofmt-clean: %v", err)
+		t.Fatalf("not gofmt-clean: %v", err)
 	}
 	for _, want := range []string{"package xormodel", "func Predict(input []float32) []float32", "0x"} {
 		if !strings.Contains(string(src), want) {
-			t.Fatalf("generated code missing %q", want)
+			t.Fatalf("missing %q in generated code", want)
 		}
 	}
 }
 
 func TestGenerateGoOmitsMathWhenUnused(t *testing.T) {
-	// Linear-only model must not import math (TinyGo footprint).
-	net := Network.MLP([]int{2, 2}, Network.Linear, Network.Linear)
-	src, _ := GenerateGo(net.ToConfig(), Options{})
+	rng := nn.NewRNG(1)
+	m, _ := nn.Sequential([]int{1, 2}, nn.Linear(rng, 2, 2, nil), nn.ReLU())
+	src, err := GenerateGo(modelJSON(t, m), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(string(src), `"math"`) {
-		t.Fatal("math imported but no activation needs it")
+		t.Fatal("math imported but no used activation needs it")
+	}
+}
+
+func TestGenerateGoRejectsUnsupportedModule(t *testing.T) {
+	rng := nn.NewRNG(1)
+	m, _ := nn.Sequential([]int{1, 1, 4, 4},
+		nn.Conv2D(rng, 1, 2, 3, 1, nil),
+	)
+	_, err := GenerateGo(modelJSON(t, m), Options{})
+	if err == nil || !strings.Contains(err.Error(), "conv2d") {
+		t.Fatalf("want unsupported-type error naming conv2d, got %v", err)
 	}
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+Before finalizing this test: check `nn.Conv2D`'s real constructor signature in `nn/conv.go` and the `Sequential` input shape it expects (see `nn/conv_test.go` for a working call) and adjust the third test accordingly.
 
-Run: `go test ./export/ -v`
-Expected: FAIL — package export does not exist / `GenerateGo` undefined
+- [ ] **Step 2: Run to verify failure** — `go test ./export/ -v` → FAIL: package missing.
+- [ ] **Step 3: Implement** `export/codegen.go` per the contract above. Structure: local structs `moduleDoc{Type string; Config json.RawMessage; Params map[string]paramDoc; Modules []moduleDoc}`, `paramDoc{Shape []int; Data []float32}` with the same JSON tags as `nn/serialize.go`; walk root's `Modules`, build two buffers (declarations + body statements), track used helpers; validate linear params (`len(W.Data) == in*out`, `len(B.Data) == out`, widths chain correctly).
+- [ ] **Step 4: Run to verify pass** — `go test ./export/ -v` → PASS (3 tests).
+- [ ] **Step 5: Commit** — `git add export/ && git commit -m "feat(export): generate dependency-free Go inference source from model JSON"`
 
-- [ ] **Step 3: Implement**
+---
 
-```go
-// export/codegen.go
-package export
-
-import (
-	"bytes"
-	"fmt"
-	"go/format"
-	"strconv"
-
-	"neugo/Network"
-)
-
-type Options struct {
-	Package  string // default "model"
-	FuncName string // default "Predict"
-}
-
-// activations that require the math import
-func needsMath(t Network.ActivationType) bool {
-	switch t {
-	case Network.Sigmoid, Network.Tanh, Network.Softmax:
-		return true
-	}
-	return false
-}
-
-func GenerateGo(cfg Network.ModelConfig, opts Options) ([]byte, error) {
-	if opts.Package == "" {
-		opts.Package = "model"
-	}
-	if opts.FuncName == "" {
-		opts.FuncName = "Predict"
-	}
-	if len(cfg.Layers) < 2 || len(cfg.Weights) != len(cfg.Layers)-1 {
-		return nil, fmt.Errorf("export: config has %d layers and %d weight blocks; want blocks = layers-1 >= 1",
-			len(cfg.Layers), len(cfg.Weights))
-	}
-
-	var b bytes.Buffer
-	fmt.Fprintf(&b, "// Code generated by neugo export. DO NOT EDIT.\n")
-	fmt.Fprintf(&b, "// Source model: %d layers, loss=%d, version=%s\n", len(cfg.Layers), cfg.LossType, cfg.Version)
-	fmt.Fprintf(&b, "package %s\n\n", opts.Package)
-
-	useMath := false
-	usedKinds := map[int]bool{}
-	for _, lc := range cfg.Layers[1:] {
-		usedKinds[int(lc.ActivationType)] = true
-		if needsMath(lc.ActivationType) {
-			useMath = true
-		}
-	}
-	if useMath {
-		fmt.Fprintf(&b, "import \"math\"\n\n")
-	}
-
-	// One flat row-major weight var per layer gap; hex literals for exact round-trip.
-	for l, W := range cfg.Weights {
-		fmt.Fprintf(&b, "var w%d = []float32{", l)
-		for j, row := range W {
-			for k, v := range row {
-				if (j*len(row)+k)%8 == 0 {
-					fmt.Fprintf(&b, "\n\t")
-				}
-				fmt.Fprintf(&b, "%s, ", strconv.FormatFloat(float64(v), 'x', -1, 32))
-			}
-		}
-		fmt.Fprintf(&b, "\n}\n\n")
-	}
-
-	fmt.Fprintf(&b, "var (\n\tnnWeights = [][]float32{")
-	for l := range cfg.Weights {
-		fmt.Fprintf(&b, "w%d, ", l)
-	}
-	fmt.Fprintf(&b, "}\n\tnnCols = []int{")
-	for _, lc := range cfg.Layers[1:] {
-		fmt.Fprintf(&b, "%d, ", lc.Size)
-	}
-	fmt.Fprintf(&b, "}\n\tnnAct = []int{")
-	for _, lc := range cfg.Layers[1:] {
-		fmt.Fprintf(&b, "%d, ", int(lc.ActivationType))
-	}
-	fmt.Fprintf(&b, "}\n)\n\n")
-
-	fmt.Fprintf(&b, `// %s runs inference. len(input) must be %d; returns %d values.
-func %s(input []float32) []float32 {
-	cur := input
-	for l := range nnWeights {
-		cols := nnCols[l]
-		next := make([]float32, cols)
-		W := nnWeights[l]
-		for j := 0; j < len(cur); j++ {
-			xj := cur[j]
-			row := W[j*cols : j*cols+cols]
-			for k := range row {
-				next[k] += xj * row[k]
-			}
-		}
-		if len(W) == (len(cur)+1)*cols { // trailing bias row
-			row := W[len(cur)*cols:]
-			for k := range row {
-				next[k] += row[k]
-			}
-		}
-		nnApplyAct(next, nnAct[l])
-		cur = next
-	}
-	return cur
-}
-`, opts.FuncName, cfg.Layers[0].Size, cfg.Layers[len(cfg.Layers)-1].Size, opts.FuncName)
-
-	writeApplyAct(&b, usedKinds)
-	return format.Source(b.Bytes())
-}
-```
-
-And `writeApplyAct` in the same file — emit only the cases in `usedKinds`. **Copy the exact math from `Network/activation.go`** (same LeakyReLU slope constant, same Sigmoid formulation) so scalar activations match bit-for-bit:
-
-```go
-func writeApplyAct(b *bytes.Buffer, used map[int]bool) {
-	fmt.Fprintf(b, "\nfunc nnApplyAct(v []float32, kind int) {\n\tswitch kind {\n")
-	if used[int(Network.Sigmoid)] {
-		fmt.Fprintf(b, "\tcase %d:\n\t\tfor i := range v {\n\t\t\tv[i] = float32(1.0 / (1.0 + math.Exp(float64(-v[i]))))\n\t\t}\n", int(Network.Sigmoid))
-	}
-	if used[int(Network.ReLU)] {
-		fmt.Fprintf(b, "\tcase %d:\n\t\tfor i := range v {\n\t\t\tif v[i] < 0 {\n\t\t\t\tv[i] = 0\n\t\t\t}\n\t\t}\n", int(Network.ReLU))
-	}
-	if used[int(Network.Tanh)] {
-		fmt.Fprintf(b, "\tcase %d:\n\t\tfor i := range v {\n\t\t\tv[i] = float32(math.Tanh(float64(v[i])))\n\t\t}\n", int(Network.Tanh))
-	}
-	// Linear: no case needed (identity) — but emit an empty case if used, for clarity.
-	if used[int(Network.LeakyReLU)] {
-		fmt.Fprintf(b, "\tcase %d:\n\t\tfor i := range v {\n\t\t\tif v[i] < 0 {\n\t\t\t\tv[i] *= 0.01 // keep in sync with Network/activation.go\n\t\t\t}\n\t\t}\n", int(Network.LeakyReLU))
-	}
-	if used[int(Network.Softmax)] {
-		fmt.Fprintf(b, `	case %d: // true vector softmax; see plan note on engine divergence
-		max := v[0]
-		for _, x := range v[1:] {
-			if x > max {
-				max = x
-			}
-		}
-		var sum float32
-		for i := range v {
-			v[i] = float32(math.Exp(float64(v[i] - max)))
-			sum += v[i]
-		}
-		for i := range v {
-			v[i] /= sum
-		}
-`, int(Network.Softmax))
-	}
-	fmt.Fprintf(b, "\t}\n}\n")
-}
-```
-
-Before writing: open `Network/activation.go`, confirm the LeakyReLU slope (adjust `0.01` if it differs) and the exact Sigmoid expression.
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `go test ./export/ -v`
-Expected: PASS (2 tests)
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add export/codegen.go export/codegen_test.go
-git commit -m "feat(export): generate dependency-free Go inference source from ModelConfig"
-```
-
-### Task 1.2: Compile-and-run parity test
+### Task 3: Export compile-and-run parity test
 
 **Files:**
 - Create: `export/parity_test.go`
 
-**Interfaces:**
-- Consumes: `GenerateGo`, `Network.Predict` (Task 0.1).
-- Produces: proof that generated code is **exactly** equal to the engine's outputs.
+**Interfaces:** consumes `GenerateGo`, `nn.Marshal`, `nn` forward. Proves generated code output `==` engine output (bitwise, float32).
 
-- [ ] **Step 1: Write the test (it should pass if 1.1 is correct — this is a verification task, failure means a codegen bug)**
+- [ ] **Step 1: Write the test**
 
 ```go
 // export/parity_test.go
 package export
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
-	"neugo/Network"
+	"neugo/nn"
 )
 
-// Compiles the generated package in a temp module with a tiny main that reads
-// inputs as JSON on stdin and writes outputs as JSON on stdout, then compares
-// against Network.Predict. Hex-float literals make this an exact comparison.
 func TestGeneratedCodeMatchesEngineExactly(t *testing.T) {
 	if testing.Short() {
 		t.Skip("compiles a subprocess")
 	}
-	net := Network.MLP([]int{3, 8, 5, 2}, Network.ReLU, Network.Sigmoid)
-	src, err := GenerateGo(net.ToConfig(), Options{Package: "main", FuncName: "Predict"})
+	rng := nn.NewRNG(42)
+	m, err := nn.Sequential([]int{1, 3},
+		nn.Linear(rng, 3, 8, nil), nn.ReLU(),
+		nn.Linear(rng, 8, 5, nil), nn.Tanh(),
+		nn.Linear(rng, 5, 3, nil), nn.Softmax(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := nn.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := GenerateGo(data, Options{Package: "main", FuncName: "Predict"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,20 +337,25 @@ func main() {
 	stdin, _ := json.Marshal(inputs)
 	cmd := exec.Command("go", "run", ".")
 	cmd.Dir = dir
-	cmd.Stdin = bytesReader(stdin)
+	cmd.Stdin = bytes.NewReader(stdin)
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("go run failed: %v\n%s", err, out)
+		t.Fatalf("go run failed: %v", err)
 	}
 	var got [][]float32
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("bad subprocess output: %v\n%s", err, out)
 	}
+	ctx := &nn.Context{Mode: nn.Inference}
 	for i, in := range inputs {
-		want := net.Predict(in)
-		for k := range want {
-			if got[i][k] != want[k] { // exact, not epsilon
-				t.Fatalf("input %d output %d: generated %v != engine %v", i, k, got[i][k], want[k])
+		x, _ := nn.NewTensorFromData(append([]float32(nil), in...), []int{1, len(in)})
+		wantT, err := m.Forward(ctx, x)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, want := range wantT.Data {
+			if got[i][k] != want { // exact float32 equality, no epsilon
+				t.Fatalf("input %d output %d: generated %v != engine %v", i, k, got[i][k], want)
 			}
 		}
 	}
@@ -579,295 +369,130 @@ func writeFile(t *testing.T, path string, data []byte) {
 }
 ```
 
-(`bytesReader` is `bytes.NewReader` — import `bytes`.)
+- [ ] **Step 2: Run** — `go test ./export/ -run Parity -v` (and the exact test name). Expected: PASS. A mismatch means a codegen bug (accumulation order or activation math differs from `nn`) — fix `codegen.go`, never widen the test to epsilon.
+- [ ] **Step 3: Commit** — `git add export/parity_test.go && git commit -m "test(export): exact bitwise parity between generated code and engine"`
 
-- [ ] **Step 2: Run**
+---
 
-Run: `go test ./export/ -run TestGeneratedCodeMatchesEngineExactly -v`
-Expected: PASS. If outputs differ, the bug is in codegen (bias-row detection or activation math) — fix `codegen.go`, not the test. Exact equality is achievable because both sides do the same float32 ops in the same order.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add export/parity_test.go
-git commit -m "test(export): exact parity between generated code and engine"
-```
-
-### Task 1.3: CLI — `neugo export`
+### Task 4: `neugo` CLI with `export` subcommand
 
 **Files:**
 - Create: `cmd/neugo/main.go`
 - Test: `cmd/neugo/main_test.go`
 
 **Interfaces:**
-- Consumes: `Network.LoadFromFile`, `export.GenerateGo`.
-- Produces: binary `neugo` with subcommand: `neugo export -model model.json -out model_gen.go -pkg model -fn Predict`. Internal seam for testing: `func run(args []string, stderr io.Writer) error`.
+- Consumes: `export.GenerateGo` (reads the model JSON file directly — no `nn` import needed).
+- Produces: `neugo export -model <model.json> -out <file.go> [-pkg model] [-fn Predict]`; testing seam `func run(args []string, stderr io.Writer) error`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test** — two tests: (a) `TestExportSubcommand`: build a small model with `nn.Sequential`+`nn.Save` into `t.TempDir()`, call `run([]string{"export", "-model", mPath, "-out", oPath, "-pkg", "mymodel"}, io.Discard)`, assert no error and the output file contains `package mymodel`; (b) `TestUnknownSubcommandErrors`: `run([]string{"bogus"}, io.Discard)` returns an error.
+- [ ] **Step 2: Run to verify failure** — `go test ./cmd/neugo/ -v` → FAIL: `run` undefined.
+- [ ] **Step 3: Implement** — `main()` calls `run(os.Args[1:], os.Stderr)`, exits 1 on error; `run` switches on `args[0]`; `export` uses a `flag.FlagSet` (ContinueOnError, output to stderr param) with the four flags; `-model` required; `os.ReadFile` model JSON → `export.GenerateGo` → `os.WriteFile` 0644; success message to the stderr writer.
+- [ ] **Step 4: Run to verify pass** — `go test ./cmd/neugo/ -v` → PASS. Smoke: train nothing — just `go run ./cmd/neugo export` with a missing model → clean error, not panic.
+- [ ] **Step 5: Commit** — `git add cmd/ && git commit -m "feat(cmd): neugo CLI with export subcommand"`
 
-```go
-// cmd/neugo/main_test.go
-package main
+---
 
-import (
-	"bytes"
-	"os"
-	"path/filepath"
-	"strings"
-	"testing"
-
-	"neugo/Network"
-)
-
-func TestExportSubcommand(t *testing.T) {
-	dir := t.TempDir()
-	modelPath := filepath.Join(dir, "m.json")
-	outPath := filepath.Join(dir, "m_gen.go")
-	net := Network.QuickBinary(2, 4)
-	if err := net.SaveToFile(modelPath); err != nil {
-		t.Fatal(err)
-	}
-
-	err := run([]string{"export", "-model", modelPath, "-out", outPath, "-pkg", "mymodel"}, &bytes.Buffer{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	src, _ := os.ReadFile(outPath)
-	if !strings.Contains(string(src), "package mymodel") {
-		t.Fatalf("output missing package clause:\n%s", src)
-	}
-}
-
-func TestUnknownSubcommandErrors(t *testing.T) {
-	if err := run([]string{"bogus"}, &bytes.Buffer{}); err == nil {
-		t.Fatal("want error for unknown subcommand")
-	}
-}
-```
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `go test ./cmd/neugo/ -v`
-Expected: FAIL — `run` undefined
-
-- [ ] **Step 3: Implement**
-
-```go
-// cmd/neugo/main.go
-package main
-
-import (
-	"flag"
-	"fmt"
-	"io"
-	"os"
-
-	"neugo/Network"
-	"neugo/export"
-)
-
-func main() {
-	if err := run(os.Args[1:], os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "neugo:", err)
-		os.Exit(1)
-	}
-}
-
-func run(args []string, stderr io.Writer) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: neugo export -model <model.json> -out <file.go> [-pkg model] [-fn Predict]")
-	}
-	switch args[0] {
-	case "export":
-		fs := flag.NewFlagSet("export", flag.ContinueOnError)
-		fs.SetOutput(stderr)
-		model := fs.String("model", "", "path to model JSON (required)")
-		out := fs.String("out", "model_gen.go", "output .go file")
-		pkg := fs.String("pkg", "model", "package name for generated file")
-		fn := fs.String("fn", "Predict", "name of generated inference function")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *model == "" {
-			return fmt.Errorf("export: -model is required")
-		}
-		net, err := Network.LoadFromFile(*model)
-		if err != nil {
-			return fmt.Errorf("export: load %s: %w", *model, err)
-		}
-		src, err := export.GenerateGo(net.ToConfig(), export.Options{Package: *pkg, FuncName: *fn})
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(*out, src, 0o644); err != nil {
-			return err
-		}
-		fmt.Fprintf(stderr, "wrote %s (package %s, func %s)\n", *out, *pkg, *fn)
-		return nil
-	default:
-		return fmt.Errorf("unknown subcommand %q", args[0])
-	}
-}
-```
-
-- [ ] **Step 4: Run to verify pass**
-
-Run: `go test ./cmd/neugo/ -v` then smoke: `go run ./cmd/neugo export -model xor_final_model.json -out /tmp/xor_gen.go -pkg xor`
-Expected: PASS; smoke prints `wrote /tmp/xor_gen.go ...`
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add cmd/neugo/
-git commit -m "feat(cmd): neugo CLI with export subcommand"
-```
-
-### Task 1.4: Cross-target proof (WASM) + docs
+### Task 5: Export cross-target proof (WASM) + guide
 
 **Files:**
 - Create: `export/crosstarget_test.go`
 - Create: `docs/EXPORT_GUIDE.md`
 
-- [ ] **Step 1: Write the WASM build test**
-
-```go
-// export/crosstarget_test.go
-package export
-
-import (
-	"os/exec"
-	"path/filepath"
-	"testing"
-
-	"neugo/Network"
-)
-
-// Proves the headline: generated model code cross-compiles to WASM with stock Go.
-func TestGeneratedCodeBuildsForWasm(t *testing.T) {
-	if testing.Short() {
-		t.Skip("invokes the go toolchain")
-	}
-	net := Network.QuickBinary(4, 8)
-	src, err := GenerateGo(net.ToConfig(), Options{Package: "model"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "model.go"), src)
-	writeFile(t, filepath.Join(dir, "go.mod"), []byte("module wasmcheck\n\ngo 1.25\n"))
-	cmd := exec.Command("go", "build", "./...")
-	cmd.Dir = dir
-	cmd.Env = append(cmd.Environ(), "GOOS=js", "GOARCH=wasm")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("wasm build failed: %v\n%s", err, out)
-	}
-}
-```
-
-- [ ] **Step 2: Run**
-
-Run: `go test ./export/ -run Wasm -v`
-Expected: PASS
-
-- [ ] **Step 3: Write `docs/EXPORT_GUIDE.md`** — short guide: train → `SaveToFile` → `neugo export` → drop the file in any repo; sections with exact commands for (a) native binary, (b) `GOOS=js GOARCH=wasm go build` browser demo, (c) TinyGo flash for a microcontroller (`tinygo build -target=arduino`), noting TinyGo is untested in CI and the generated code's only import is `math`.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add export/crosstarget_test.go docs/EXPORT_GUIDE.md
-git commit -m "test(export): WASM cross-compile proof; add export guide"
-```
+- [ ] **Step 1: Write the WASM build test** — like the parity test's temp-module setup but only the generated file + go.mod (package `model`, no main); run `go build ./...` with `cmd.Env = append(cmd.Environ(), "GOOS=js", "GOARCH=wasm")`; skip under `testing.Short()`. Model: `nn.Linear`+`nn.Sigmoid` suffices.
+- [ ] **Step 2: Run** — `go test ./export/ -run Wasm -v` → PASS.
+- [ ] **Step 3: Write `docs/EXPORT_GUIDE.md`** — sections: train & save (`nn.Save`), `go run ./cmd/neugo export -model m.json -out model_gen.go -pkg model`, drop into any Go project (zero deps, only `math`); cross-compile recipes: native (`GOOS=linux GOARCH=arm64 go build`), browser WASM (`GOOS=js GOARCH=wasm`), TinyGo (`tinygo build -target=<board>`, noted as not CI-covered); supported module types list + the v1 unsupported list (conv/pool/flatten/batchnorm) verbatim from Task 2; exactness guarantee (hex-float literals, bitwise parity with the engine).
+- [ ] **Step 4: Commit** — `git add export/crosstarget_test.go docs/EXPORT_GUIDE.md && git commit -m "test(export): WASM cross-compile proof; add export guide"`
 
 ---
 
-# Part 2 — `serve`: hot-swap serving with online learning
-
-Design (contract for all tasks in this part):
-
-- `modelVersion` = one immutable generation: `{ gen uint64; cfg Network.ModelConfig; pool sync.Pool }`. The pool hands out **reader clones** (shared weights, private neurons — Task 0.2), so concurrent `/predict` never contends on a lock for inference.
-- `Server.current` is `atomic.Pointer[modelVersion]`. Hot swap = build a new `modelVersion` from a trained candidate's deep config, `current.Store(v)`. Old readers drain naturally; no request is ever interrupted.
-- Online learning: `/feedback` pushes labeled samples into a bounded channel; one trainer goroutine accumulates them in a ring buffer; every `RetrainEvery` samples it deep-clones the current model, trains on the buffer, then a **validation gate** (holdout set) decides swap or reject. Previous version is retained for `/admin/rollback`.
-- Metrics: hand-rolled counters/gauges exposed in Prometheus text format at `/metrics` (stdlib only).
-
-HTTP API:
-
-| Method/Path | Body → Response |
-|---|---|
-| POST `/predict` | `{"input":[...]}` → `{"output":[...],"model_gen":3}` |
-| POST `/feedback` | `{"input":[...],"label":[...]}` → 202 |
-| GET `/healthz` | → 200 `{"model_gen":3}` |
-| GET `/metrics` | → Prometheus text |
-| POST `/admin/rollback` | → 200 `{"model_gen":2}` (409 if no previous) |
-
-### Task 2.1: metrics primitives
+### Task 6: `serve` metrics primitives
 
 **Files:**
 - Create: `serve/metrics.go`
 - Test: `serve/metrics_test.go`
 
 **Interfaces:**
-- Produces: `type metrics struct` with `atomic.Int64` counters `predictTotal, feedbackTotal, swapTotal, swapRejectedTotal` and an `atomic.Uint64` gauge `modelGen`; method `writePrometheus(w io.Writer)` emitting lines like `neugo_predict_total 42`.
+- Produces: unexported `type metrics struct` with `atomic.Int64` fields `predictTotal, feedbackTotal, feedbackDropped, swapTotal, swapRejectedTotal` and `atomic.Uint64` field `modelGen`; method `writePrometheus(w io.Writer)` emitting, per metric, a `# TYPE neugo_<name> counter` (or `gauge` for `neugo_model_generation`) line then `neugo_<name> <value>`. Metric names: `neugo_predict_total`, `neugo_feedback_total`, `neugo_feedback_dropped_total`, `neugo_swap_total`, `neugo_swap_rejected_total`, `neugo_model_generation`.
 
-- [ ] **Step 1: Failing test** — construct `metrics`, bump counters, assert `writePrometheus` output contains `neugo_predict_total 2` and `neugo_model_generation 7`; assert every line matches `^[a-z_]+ \d+$` (valid exposition format).
-- [ ] **Step 2: Run** `go test ./serve/ -v` — FAIL (package missing).
-- [ ] **Step 3: Implement** — struct with the five atomics; `writePrometheus` uses `fmt.Fprintf` with a `# TYPE <name> counter|gauge` line before each metric.
+- [ ] **Step 1: Failing test** — bump `predictTotal` twice and `modelGen` to 7; capture `writePrometheus` into a `bytes.Buffer`; assert it contains `neugo_predict_total 2` and `neugo_model_generation 7`; assert every non-`#` line matches `^[a-z_]+ [0-9]+$` (`regexp`).
+- [ ] **Step 2: Run** — `go test ./serve/ -v` → FAIL (package missing).
+- [ ] **Step 3: Implement** as specified. No locks — atomics only.
 - [ ] **Step 4: Run** — PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(serve): stdlib prometheus-format metrics"`
+- [ ] **Step 5: Commit** — `git add serve/ && git commit -m "feat(serve): stdlib prometheus-format metrics"`
 
-### Task 2.2: Server core — `/predict`, `/healthz`, hot-swap plumbing
+---
+
+### Task 7: `serve` core — lock-free hot-swap serving
 
 **Files:**
 - Create: `serve/server.go`
 - Test: `serve/server_test.go`
 
 **Interfaces:**
-- Consumes: `Network.CloneReader`, `Network.CloneDeep`, `Network.DeepCopyConfig`, `Network.NetworkFromConfig`, `Network.Predict`, `metrics` (2.1).
-- Produces (used by 2.3/2.4 and by users):
+- Consumes: `nn.Marshal`, `nn.Unmarshal` (Task 1), `nn.SequentialModel.Forward`, `nn.Context{Mode: nn.Inference}`, `nn.NewTensorFromData`, `metrics` (Task 6).
+- Produces (Tasks 8–9 build on these exact signatures):
 
 ```go
-type Config struct {
-	Holdout            []Sample // required for online learning; may be nil for serve-only
-	BufferSize         int      // ring buffer capacity, default 1024
-	RetrainEvery       int      // retrain after N feedback samples, default 256
-	Epochs             int      // per retrain, default 5
-	LearningRate       float32  // default 0.05
-	MaxValLossIncrease float32  // gate slack, default 0 (candidate must be >= as good)
-}
 type Sample struct{ X, Y []float32 }
 
-func New(net *Network.Network, cfg Config) *Server
-func (s *Server) Handler() http.Handler          // full mux
+type Config struct {
+	InputDim           int          // required; length every input must have
+	Loss               train.Loss   // required for online learning (Task 8); nil = serve-only
+	Holdout            []Sample     // required for online learning; nil = serve-only
+	BufferSize         int          // ring buffer capacity, default 1024
+	RetrainEvery       int          // retrain after N feedback samples, default 256
+	Epochs             int          // per retrain, default 5
+	LearningRate       float32      // default 0.05
+	MaxValLossIncrease float32      // gate slack, default 0 (candidate must be at least as good)
+}
+
+func New(model *nn.SequentialModel, cfg Config) (*Server, error) // errors if InputDim <= 0 or Marshal fails
+func (s *Server) Handler() http.Handler                          // routes below
 func (s *Server) ListenAndServe(addr string) error
-func (s *Server) Predict(x []float32) ([]float32, uint64)  // output + generation
-func (s *Server) swapIn(cfg Network.ModelConfig)           // internal: install new generation
+func (s *Server) Predict(x []float32) ([]float32, uint64, error) // output, model generation
+func (s *Server) Generation() uint64
+// internal: func (s *Server) swapIn(doc []byte)  — installs a new generation
 ```
+
+Routes (JSON bodies; wrong input length or malformed JSON → 400 `{"error":"..."}`):
+
+| Method/Path | Body → Response |
+|---|---|
+| POST `/predict` | `{"input":[...]}` → `{"output":[...],"model_gen":3}` |
+| GET `/healthz` | → 200 `{"model_gen":3}` |
+
+(`/feedback`, `/metrics`, `/admin/rollback` arrive in Tasks 8–9.)
+
+**Core design (must be preserved):** `modelVersion{gen uint64; doc []byte; pool sync.Pool}` where `pool.New = func() any { m, err := nn.Unmarshal(v.doc); ... }` (on unmarshal error — impossible for a doc that round-tripped once — panic with context). `Server.current` is `atomic.Pointer[modelVersion]`. `Predict` loads current, gets a clone from its pool, builds a `[1, InputDim]` tensor, `Forward` with Inference mode, copies out `out.Data`, puts the clone back. Swap = store a new `modelVersion`; a clone fetched from an old version mid-request stays valid and is returned to the old version's pool (GC'd with it) — no locking anywhere on the predict path. Clones are needed because `nn` modules cache forward inputs even in Inference mode (`nn/linear.go:57`).
 
 - [ ] **Step 1: Failing tests**
 
 ```go
-// serve/server_test.go — core cases
-func TestPredictHTTP(t *testing.T)        // POST /predict on XOR-trained model returns output + model_gen 1
-func TestPredictConcurrent(t *testing.T)  // 100 goroutines x 50 requests; run with -race; all succeed, outputs consistent
-func TestSwapBumpsGeneration(t *testing.T) // s.swapIn(newCfg) then Predict reports gen 2 and new weights' outputs
-func TestHealthz(t *testing.T)
+// serve/server_test.go — required cases (write real code for each):
+// helper: tinyModel(t) — nn.Sequential([]int{1,2}, nn.Linear(rng,2,4,nil), nn.ReLU(), nn.Linear(rng,4,1,nil), nn.Sigmoid())
+func TestPredictHTTP(t *testing.T)           // httptest: POST /predict {"input":[1,0]} → 200, 1 output, model_gen 1
+func TestPredictWrongLength(t *testing.T)    // {"input":[1]} → 400 with error JSON
+func TestHealthz(t *testing.T)               // → {"model_gen":1}
+func TestSwapBumpsGeneration(t *testing.T)   // swapIn(marshal of a different model) → Predict returns gen 2 and different output
+func TestPredictConcurrent(t *testing.T)     // below — the load-bearing one; -race must pass
 ```
-
-The concurrency test is the load-bearing one:
 
 ```go
 func TestPredictConcurrent(t *testing.T) {
-	net := trainXOR(t) // helper: QuickBinary(2,4) + QuickFit on XOR until loss < 0.1
-	s := New(&net, Config{})
-	want, _ := s.Predict([]float32{1, 0})
+	s := newTestServer(t) // helper wrapping New(tinyModel(t), Config{InputDim: 2})
+	want, _, err := s.Predict([]float32{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var wg sync.WaitGroup
 	for range 100 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for range 50 {
-				got, _ := s.Predict([]float32{1, 0})
-				if got[0] != want[0] {
-					t.Error("racy prediction")
+				got, _, err := s.Predict([]float32{1, 0})
+				if err != nil || got[0] != want[0] {
+					t.Errorf("racy or failed prediction: %v %v", got, err)
 					return
 				}
 			}
@@ -877,182 +502,77 @@ func TestPredictConcurrent(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run** `go test ./serve/ -race -v` — FAIL (`New` undefined).
-- [ ] **Step 3: Implement**
+- [ ] **Step 2: Run** — `go test ./serve/ -race -v` → FAIL: `New` undefined.
+- [ ] **Step 3: Implement** `serve/server.go` per the design block. Defaults applied in `New`. `Predict` must copy `out.Data` into a fresh slice before returning the clone to the pool (the tensor belongs to the clone's next caller otherwise — subtle!). Actually `Forward` allocates a fresh output tensor per call (`nn/linear.go:59`), but copy anyway and note why: the contract is "caller owns the returned slice."
+- [ ] **Step 4: Run** — `go test ./serve/ -race -v` → PASS.
+- [ ] **Step 5: Commit** — `git add serve/ && git commit -m "feat(serve): lock-free hot-swap serving core"`
 
-```go
-// serve/server.go (core shape — trainer wiring arrives in Task 2.3)
-type modelVersion struct {
-	gen  uint64
-	cfg  Network.ModelConfig // deep-copied; the version owns it
-	pool sync.Pool           // of *Network.Network reader clones
-}
+---
 
-func newModelVersion(gen uint64, cfg Network.ModelConfig) *modelVersion {
-	v := &modelVersion{gen: gen, cfg: cfg}
-	v.pool.New = func() any {
-		n := Network.NetworkFromConfig(v.cfg) // readers share v.cfg's weights
-		return &n
-	}
-	return v
-}
-
-type Server struct {
-	current  atomic.Pointer[modelVersion]
-	previous atomic.Pointer[modelVersion]
-	nextGen  atomic.Uint64
-	feedback chan Sample
-	met      metrics
-	cfg      Config
-}
-
-func New(net *Network.Network, cfg Config) *Server {
-	// defaults for BufferSize/RetrainEvery/Epochs/LearningRate as documented
-	s := &Server{cfg: withDefaults(cfg), feedback: make(chan Sample, 4096)}
-	s.nextGen.Store(2)
-	s.current.Store(newModelVersion(1, Network.DeepCopyConfig(net.ToConfig())))
-	s.met.modelGen.Store(1)
-	return s
-}
-
-func (s *Server) Predict(x []float32) ([]float32, uint64) {
-	v := s.current.Load()
-	n := v.pool.Get().(*Network.Network)
-	out := n.Predict(x)
-	v.pool.Put(n)
-	s.met.predictTotal.Add(1)
-	return out, v.gen
-}
-
-func (s *Server) swapIn(cfg Network.ModelConfig) {
-	old := s.current.Load()
-	v := newModelVersion(s.nextGen.Add(1)-1, cfg)
-	s.previous.Store(old)
-	s.current.Store(v)
-	s.met.modelGen.Store(v.gen)
-	s.met.swapTotal.Add(1)
-}
-```
-
-Subtle point the implementer must preserve: a pooled reader fetched from an **old** version's pool is still valid mid-request after a swap (weights it references are still alive via `old.cfg`); it is returned to the old pool and garbage-collected with it. That is why swap needs no locking.
-
-`Handler()` builds a `http.ServeMux` with the routes from the table; JSON request/response structs live at the top of the file (`predictRequest{Input []float32}`, `predictResponse{Output []float32; ModelGen uint64}`, etc.). Input validation: wrong input length → 400 with `{"error": "..."}` (compare against `cfg` input layer size = `v.cfg.Layers[0].Size`).
-
-- [ ] **Step 4: Run** `go test ./serve/ -race -v` — PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(serve): lock-free hot-swap serving core"`
-
-### Task 2.3: Online trainer with validation gate
+### Task 8: `serve` online learning with validation gate
 
 **Files:**
 - Create: `serve/online.go`
 - Test: `serve/online_test.go`
-- Modify: `serve/server.go` (wire `/feedback`, start/stop trainer)
+- Modify: `serve/server.go` (add `/feedback` route; `feedback chan Sample` field)
 
 **Interfaces:**
-- Consumes: `Server.swapIn`, `Network.CloneDeep`, `Network.ForwardPass`/`CalculateLoss`, `Network.TrainBatch`.
+- Consumes: `Server.swapIn`, `nn.Unmarshal`, `train.New`, `train.SGD`, `train.Epochs`, `train.BatchSize`, `train.Shuffle`, `train.Seed`, `Trainer.Fit`, `Trainer.Evaluate` (returns `train.Metrics`; use its `.Loss`), `nn.NewTensorFromData`.
 - Produces:
 
 ```go
-func (s *Server) StartOnline(ctx context.Context)  // launches trainer goroutine; no-op if cfg.Holdout == nil
-func valLoss(net *Network.Network, holdout []Sample) float32  // mean CalculateLoss over holdout
-// internal: type ringBuffer struct{...} with Push(Sample) and Snapshot() []Sample
+func (s *Server) StartOnline(ctx context.Context) error // error if cfg.Holdout or cfg.Loss is nil; starts one goroutine
+// internal:
+// type ringBuffer — fixed capacity, Push overwrites oldest, Snapshot() []Sample (copy)
+// func samplesToTensors(ss []Sample) (x, y *nn.Tensor, err error)  — shapes [n, dimX], [n, dimY]
+// func (s *Server) retrain(samples []Sample)
+// func (s *Server) holdoutLoss(doc []byte) float32 — unmarshal, Evaluate on cfg.Holdout, return Metrics.Loss
 ```
 
-- [ ] **Step 1: Failing tests**
+Trainer loop: receive from `s.feedback`; push to ring; every `RetrainEvery` received samples call `retrain(ring.Snapshot())`. `retrain`: candidate = `nn.Unmarshal(current.doc)`; `train.New(candidate, train.SGD(cfg.LearningRate), cfg.Loss)`; `Fit(x, y, train.Epochs(cfg.Epochs), train.BatchSize(min(32, len(samples))), train.Shuffle(true), train.Seed(int64(gen)))`; gate: candidate holdout loss `<=` current holdout loss `+ MaxValLossIncrease` → `swapIn(nn.Marshal(candidate))`, else `swapRejectedTotal.Add(1)`. `/feedback` handler: validate lengths (X vs InputDim; all Y same length as holdout Y), **non-blocking** channel send — on full channel drop the sample and bump `feedbackDropped` (never block a request), respond 202.
+
+- [ ] **Step 1: Failing tests** (all deterministic, no HTTP except the feedback-endpoint one, no sleeps — call `retrain` directly where possible):
 
 ```go
-func TestRingBufferOverwritesOldest(t *testing.T)
-func TestValLoss(t *testing.T) // hand-computable: trained XOR net has low loss, fresh net higher
-
-// The core behavior test — deterministic, no HTTP:
-func TestOnlineLearningSwapsWhenBetter(t *testing.T) {
-	// Start from a DELIBERATELY bad model (0 training epochs) on XOR.
-	// Holdout = the 4 XOR rows. Feed the 4 XOR samples repeatedly
-	// (RetrainEvery: 16, Epochs: 200, LearningRate: 0.5).
-	// Poll up to 5s: expect model_gen > 1 AND valLoss(current) < valLoss(initial).
-}
-
-func TestGateRejectsWorseCandidate(t *testing.T) {
-	// Feed WRONG labels (inverted XOR) but holdout stays correct:
-	// candidate trains to be worse on holdout → gate rejects.
-	// Expect: swapRejectedTotal > 0, model_gen stays 1, predictions unchanged.
-}
+func TestRingBufferOverwritesOldest(t *testing.T)  // cap 4, push 6, Snapshot has last 4 in order
+func TestSamplesToTensors(t *testing.T)            // 3 samples of dims 2/1 → shapes [3,2],[3,1]
+func TestRetrainSwapsWhenBetter(t *testing.T)
+// Untrained model on XOR; Holdout = 4 XOR rows; Loss = train.BCELoss();
+// call s.retrain(xorSamples) directly with Epochs: 300, LearningRate: 0.9.
+// Assert: Generation() == 2 and holdout loss decreased.
+func TestGateRejectsWorseCandidate(t *testing.T)
+// Model pre-trained on XOR (fit until holdout loss < 0.2 using train.Trainer in the test);
+// call s.retrain with INVERTED labels. Assert: Generation() still 1,
+// swapRejectedTotal == 1, predictions unchanged.
+func TestFeedbackEndpointAccepts(t *testing.T)     // POST /feedback → 202, feedbackTotal == 1
+func TestStartOnlineRequiresConfig(t *testing.T)   // nil Loss or Holdout → error
 ```
 
 - [ ] **Step 2: Run** — FAIL.
-- [ ] **Step 3: Implement** trainer loop:
-
-```go
-func (s *Server) StartOnline(ctx context.Context) {
-	if s.cfg.Holdout == nil {
-		return
-	}
-	go func() {
-		buf := newRingBuffer(s.cfg.BufferSize)
-		sinceRetrain := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case sm := <-s.feedback:
-				buf.Push(sm)
-				sinceRetrain++
-				if sinceRetrain < s.cfg.RetrainEvery {
-					continue
-				}
-				sinceRetrain = 0
-				s.retrain(buf.Snapshot())
-			}
-		}
-	}()
-}
-
-func (s *Server) retrain(samples []Sample) {
-	curV := s.current.Load()
-	currentNet := Network.NetworkFromConfig(curV.cfg) // reader for scoring
-	cand := currentNet.CloneDeep()
-	x := make([][]float32, len(samples))
-	y := make([][]float32, len(samples))
-	for i, sm := range samples {
-		x[i], y[i] = sm.X, sm.Y
-	}
-	for range s.cfg.Epochs {
-		cand.TrainBatch(x, y, s.cfg.LearningRate)
-	}
-	candLoss := valLoss(&cand, s.cfg.Holdout)
-	curLoss := valLoss(&currentNet, s.cfg.Holdout)
-	if candLoss <= curLoss+s.cfg.MaxValLossIncrease {
-		s.swapIn(Network.DeepCopyConfig(cand.ToConfig()))
-	} else {
-		s.met.swapRejectedTotal.Add(1)
-	}
-}
-```
-
-(`TrainBatch(inputs, labels [][]float32, learningRate float32) float32` — verified in `Network/batch.go:5`; the returned batch loss can be logged but the gate decision uses only holdout loss.) `/feedback` handler: decode, validate lengths, non-blocking send to `s.feedback` (drop + count if full — never block a request), respond 202.
-
-- [ ] **Step 4: Run** `go test ./serve/ -race -v` (all Part 2 tests) — PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(serve): online learning with holdout validation gate"`
-
-### Task 2.4: Rollback, metrics endpoint, example
-
-**Files:**
-- Modify: `serve/server.go` (rollback handler, `/metrics` route)
-- Create: `examples/serve_xor.go`
-- Test: extend `serve/server_test.go`
-
-- [ ] **Step 1: Failing tests** — `TestRollbackRestoresPreviousGeneration` (swap then rollback → old gen's outputs; second rollback → 409), `TestMetricsEndpoint` (contains `neugo_predict_total`).
-- [ ] **Step 2: Run** — FAIL.
-- [ ] **Step 3: Implement** rollback = `swapIn`-style store of `previous` into `current` (swap the pair, so rollback of rollback works); `/metrics` calls `met.writePrometheus(w)`.
-- [ ] **Step 4: Run** `go test ./serve/ -race` — PASS.
-- [ ] **Step 5: Write `examples/serve_xor.go`** (`//go:build ignore` tag like other examples if they use one — check `examples/train.go` first): trains XOR, `serve.New(...)`, `StartOnline`, `ListenAndServe(":8080")`, with a comment block of `curl` commands demonstrating predict → feedback → watch `model_gen` bump → rollback.
-- [ ] **Step 6: Commit** `git commit -m "feat(serve): rollback + metrics endpoint + example"`
+- [ ] **Step 3: Implement** per the interfaces block. `retrain` reads `s.current.Load()` once at entry (gen + doc) — swap-under-retrain is benign: the gate compares against the doc it started from.
+- [ ] **Step 4: Run** — `go test ./serve/ -race -v` → PASS.
+- [ ] **Step 5: Commit** — `git add serve/ && git commit -m "feat(serve): online learning with holdout validation gate"`
 
 ---
 
-# Part 3 — `tune`: parallel hyperparameter search with ASHA
+### Task 9: `serve` rollback + `/metrics` + example
 
-### Task 3.1: Search space and params
+**Files:**
+- Modify: `serve/server.go` (`previous` field, `/admin/rollback`, `/metrics` routes)
+- Test: extend `serve/server_test.go`
+- Create: `examples/serve_xor/main.go`
+
+- [ ] **Step 1: Failing tests** — `TestRollbackRestoresPreviousGeneration` (after one swap: rollback → 200, `Predict` returns the *old* outputs under a *new* generation number; `previous` and `current` exchange, so rollback-of-rollback returns to the newer model); `TestRollbackWithoutPrevious` (fresh server → 409); `TestMetricsEndpoint` (GET `/metrics` contains `neugo_predict_total` and `neugo_model_generation`).
+- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 3: Implement** — `swapIn` stores the displaced version into `s.previous` (plain `atomic.Pointer[modelVersion]`); rollback exchanges current/previous under a small mutex (rollback is not a hot path; the predict path stays lock-free) and installs the restored doc as a **new generation number** (monotonic gen, never reuse), bumping `swapTotal`.
+- [ ] **Step 4: Run** — `go test ./serve/ -race -v` → PASS.
+- [ ] **Step 5: Write `examples/serve_xor/main.go`** — follows `examples/xor/main.go` conventions: build+train XOR with `nn`/`train`, `serve.New` with holdout+BCE config, `StartOnline(context.Background())`, print the curl walkthrough (predict → feedback ×N → healthz shows gen bump → rollback), `ListenAndServe(":8080")`.
+- [ ] **Step 6: Verify example compiles** — `go build ./examples/serve_xor/` → OK.
+- [ ] **Step 7: Commit** — `git add serve/ examples/serve_xor/ && git commit -m "feat(serve): rollback + metrics endpoint + serve_xor example"`
+
+---
+
+### Task 10: `tune` search space
 
 **Files:**
 - Create: `tune/space.go`
@@ -1064,47 +584,48 @@ func (s *Server) retrain(samples []Sample) {
 ```go
 func NewSpace() *Space
 func (s *Space) Float(name string, min, max float64) *Space     // uniform
-func (s *Space) LogFloat(name string, min, max float64) *Space  // log-uniform, min > 0
-func (s *Space) Int(name string, min, max int) *Space           // inclusive
+func (s *Space) LogFloat(name string, min, max float64) *Space  // log-uniform; panics if min <= 0 or max < min
+func (s *Space) Int(name string, min, max int) *Space           // inclusive both ends
 func (s *Space) Choice(name string, options ...string) *Space
 func (s *Space) Sample(r *rand.Rand) Params
 
 type Params map[string]any
-func (p Params) Float(name string) float64  // panics with a clear message on wrong name/type
+func (p Params) Float(name string) float64  // panics with clear message on missing name / wrong kind
 func (p Params) Int(name string) int
 func (p Params) Choice(name string) string
 ```
 
-- [ ] **Step 1: Failing test** — sample 1000 times with a seeded `rand.New(rand.NewSource(1))`: Float stays in [min,max]; LogFloat(1e-4, 1e-1) produces ≥10% of samples below 1e-3 (log-uniformity smoke check — uniform would give ~0.9%); Int inclusive of both ends over many draws; Choice returns only listed options; same seed ⇒ identical sample sequence (determinism).
-- [ ] **Step 2: Run** `go test ./tune/ -v` — FAIL.
-- [ ] **Step 3: Implement** — `Space` holds `[]paramDef{name, kind, fmin, fmax, imin, imax, choices}`; `Sample` iterates in insertion order (determinism depends on it — do not use a map); LogFloat: `math.Exp(lo + r.Float64()*(hi-lo))` with `lo, hi := math.Log(min), math.Log(max)`.
+- [ ] **Step 1: Failing test** — with `rand.New(rand.NewSource(1))`: 1000 samples of `Float("x",-2,2)` all in range; `LogFloat("lr",1e-4,1e-1)`: all in range AND ≥10% of samples < 1e-3 (uniform would give ~0.9% — this asserts log-uniformity); `Int("h",4,8)` hits both 4 and 8 across 1000 draws, never outside; `Choice` only returns listed options; two spaces sampled with same seed produce identical sequences (`reflect.DeepEqual` over 20 draws); `Params.Float("missing")` panics (use `defer/recover`).
+- [ ] **Step 2: Run** — `go test ./tune/ -v` → FAIL.
+- [ ] **Step 3: Implement** — `Space` holds an ordered `[]paramDef` slice (NOT a map — `Sample` iterates insertion order; determinism depends on it); LogFloat: `math.Exp(lo + r.Float64()*(hi-lo))` with `lo, hi := math.Log(min), math.Log(max)`; Int: `min + r.Intn(max-min+1)`.
 - [ ] **Step 4: Run** — PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(tune): search space with deterministic sampling"`
+- [ ] **Step 5: Commit** — `git add tune/ && git commit -m "feat(tune): search space with deterministic sampling"`
 
-### Task 3.2: Worker-pool runner (random search)
+---
+
+### Task 11: `tune` worker-pool runner (random search)
 
 **Files:**
 - Create: `tune/tuner.go`, `tune/result.go`
 - Test: `tune/tuner_test.go`
 
 **Interfaces:**
-- Consumes: `Space.Sample`, `Params`.
-- Produces:
+- Consumes: `Space.Sample`, `Params` (Task 10).
+- Produces (Task 12 extends `Trial`):
 
 ```go
 type Trial struct {
 	ID     int
 	Params Params
-	Seed   int64 // cfg.Seed + ID; objective should use this for any RNG it needs
-	// ASHA fields added in Task 3.3
+	Seed   int64 // cfg.Seed + int64(ID); objectives use this for their own RNG
 }
 type Objective func(t *Trial) (float64, error)
 type Config struct {
 	Trials   int
-	Workers  int   // default runtime.NumCPU()
+	Workers  int   // <=0 → runtime.NumCPU()
 	Seed     int64
-	Maximize bool  // default false = minimize
-	ASHA     *ASHAConfig // nil = no pruning (Task 3.3)
+	Maximize bool  // false = minimize
+	ASHA     *ASHAConfig // Task 12; nil = no pruning
 }
 type TrialResult struct {
 	ID       int
@@ -1114,52 +635,45 @@ type TrialResult struct {
 	Pruned   bool
 	Duration time.Duration
 }
-type Results struct{ Trials []TrialResult; /* sorted best-first */ }
+type Results struct{ Trials []TrialResult } // sorted best-first; errored/pruned trials after all scored ones
 func (r *Results) Best() TrialResult
 func (r *Results) Top(k int) []TrialResult
-func (r *Results) String() string // aligned table via text/tabwriter
+func (r *Results) String() string // text/tabwriter table: rank, ID, value, params
 func Run(ctx context.Context, space *Space, obj Objective, cfg Config) (*Results, error)
 ```
+
+**Determinism rule (binding):** sample ALL trial params up front, sequentially, from one `rand.New(rand.NewSource(cfg.Seed))` — trial i's params never depend on goroutine scheduling. Then feed prebuilt `*Trial`s through a channel to `Workers` goroutines; each writes `results[trial.ID]` (disjoint indices — no mutex); `sync.WaitGroup` join; sort at the end.
 
 - [ ] **Step 1: Failing tests**
 
 ```go
-// Deterministic objective: recover a known optimum.
-func TestRunFindsMinimum(t *testing.T) {
-	space := NewSpace().Float("x", -10, 10)
-	obj := func(tr *Trial) (float64, error) {
-		x := tr.Params.Float("x")
-		return (x - 3) * (x - 3), nil
-	}
-	res, err := Run(context.Background(), space, obj, Config{Trials: 500, Workers: 8, Seed: 42})
-	// Best x within 0.2 of 3.0; res.Best().Value < 0.05
-}
-
-// Parallelism actually happens: 32 trials x 20ms sleep on 8 workers
-// must finish well under serial time (assert < 32*20ms/2 = 320ms elapsed).
+func TestRunFindsMinimum(t *testing.T)
+// Space: Float("x", -10, 10); objective (x-3)^2; Trials: 500, Workers: 8, Seed: 42.
+// Assert Best().Value < 0.05 and |Best().Params.Float("x") - 3| < 0.25.
 func TestRunIsParallel(t *testing.T)
-
-// Same seed twice ⇒ identical Best().Params (params determinism;
-// scheduling order may differ, sampled values may not).
+// Objective sleeps 20ms; 32 trials, 8 workers. Wall time < 320ms (half of serial 640ms).
 func TestRunDeterministicParams(t *testing.T)
-
-// Objective error is captured on the TrialResult, not fatal to the run.
+// Two Runs, same Seed: Best().Params identical (DeepEqual) and same set of trial params.
 func TestObjectiveErrorRecorded(t *testing.T)
-
-// Context cancellation stops early and returns partial results + ctx.Err().
+// Objective errors for x < 0: those TrialResults carry Err, run does not fail, Best has no Err.
 func TestRunHonorsContext(t *testing.T)
+// Cancel after ~50ms with slow objective: Run returns ctx.Err(), partial Results non-nil.
+func TestMaximize(t *testing.T)
+// Maximize: true with objective -(x-3)^2 → same optimum found.
 ```
 
 - [ ] **Step 2: Run** — FAIL.
-- [ ] **Step 3: Implement** — determinism rule: **sample all trial params up front, sequentially** from one `rand.New(rand.NewSource(cfg.Seed))` (trial i's params never depend on scheduling), then feed pre-built `*Trial`s through a `chan *Trial` to `Workers` goroutines; results into a slice indexed by ID (no mutex needed — disjoint writes); `sync.WaitGroup` to join; sort by Value (respecting `Maximize`, errors and pruned trials sort last).
-- [ ] **Step 4: Run** `go test ./tune/ -race -v` — PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(tune): goroutine worker-pool random search"`
+- [ ] **Step 3: Implement** per the determinism rule. Context: workers select on `ctx.Done()` between trials; `Run` returns `(partialResults, ctx.Err())` on cancellation.
+- [ ] **Step 4: Run** — `go test ./tune/ -race -v` → PASS.
+- [ ] **Step 5: Commit** — `git add tune/ && git commit -m "feat(tune): goroutine worker-pool random search"`
 
-### Task 3.3: ASHA early stopping
+---
+
+### Task 12: `tune` ASHA early stopping
 
 **Files:**
 - Create: `tune/asha.go`
-- Modify: `tune/tuner.go` (Trial gains `Report`/`ShouldPrune`; Run wires the shared asha state)
+- Modify: `tune/tuner.go` (`Trial` gains `Report`/`ShouldPrune` and internal wiring; `Run` builds the shared asha state when `cfg.ASHA != nil`)
 - Test: `tune/asha_test.go`
 
 **Interfaces:**
@@ -1167,79 +681,75 @@ func TestRunHonorsContext(t *testing.T)
 
 ```go
 type ASHAConfig struct {
-	MinResource     int // e.g. 1 epoch
-	MaxResource     int // e.g. 81 epochs
-	ReductionFactor int // η, default 3
+	MinResource     int // e.g. 1 (epochs)
+	MaxResource     int // e.g. 81
+	ReductionFactor int // η; <=1 → default 3
 }
-// On Trial:
-func (t *Trial) Report(resource int, value float64) // record intermediate metric at a rung
-func (t *Trial) ShouldPrune() bool                  // true if last Report landed outside top 1/η at its rung
+func (t *Trial) Report(resource int, value float64) // record intermediate metric
+func (t *Trial) ShouldPrune() bool                  // true if the last Report fell outside the top 1/η at its rung
 ```
 
-Objective usage pattern (documented on `Report`):
+Documented usage pattern (goes in `Report`'s doc comment):
 
 ```go
-obj := func(tr *Trial) (float64, error) {
-	net := buildModel(tr.Params)
-	var loss float64
-	for epoch := 1; epoch <= maxEpochs; epoch++ {
-		loss = trainOneEpoch(net)
-		tr.Report(epoch, loss)
-		if tr.ShouldPrune() {
-			return loss, nil // tuner marks TrialResult.Pruned = true
-		}
+for epoch := 1; epoch <= maxEpochs; epoch++ {
+	loss = trainOneEpoch()
+	tr.Report(epoch, loss)
+	if tr.ShouldPrune() {
+		return loss, nil // tuner marks the TrialResult Pruned
 	}
-	return loss, nil
 }
 ```
+
+**Semantics:** rungs at resources `MinResource * η^k` for k = 0,1,2,… up to `MaxResource`. `Report(resource, value)`: if `resource` equals a rung's resource exactly, record the value in that rung (shared `asha` struct: `mu sync.Mutex; rungs map[int][]float64`) and decide promotion: promoted iff value is within the best `ceil(n/η)` of all values recorded at that rung so far (direction per `cfg.Maximize`; with n < η observations, promote by default — async ASHA). Reports at non-rung resources never prune. A trial that returns after `ShouldPrune()` is marked `Pruned: true` in its result (tuner-side: track that the trial's last decision was "prune"). With `cfg.ASHA == nil`, `Report` is a no-op and `ShouldPrune` always returns false.
 
 - [ ] **Step 1: Failing tests**
 
 ```go
-// Unit: rung promotion math, single-threaded.
-func TestAshaPromotesTopFraction(t *testing.T) {
-	// rung with values {1,2,...,9} already reported, η=3:
-	// a new value 1.5 (top third) → promote; value 8 → prune.
-}
-
-// Integration: objective where params with x>0 converge (loss→0 over 81 steps)
-// and x<=0 plateau at loss 10. With ASHA{1,81,3}, 200 trials:
-//   - Best().Value < 0.1
-//   - at least 30% of x<=0 trials are Pruned
-//   - total Reports across all trials is well below 200*81 (compute saved)
-func TestAshaPrunesBadTrials(t *testing.T)
+func TestRungPromotionMath(t *testing.T)
+// Direct unit test on the asha struct: rung already holds {1..9}, η=3:
+// decide(1.5) → promote (top third); decide(8.0) → prune. Minimize direction.
+func TestNonRungResourceNeverPrunes(t *testing.T)
+func TestNoASHAConfigNeverPrunes(t *testing.T)
+func TestAshaPrunesBadTrialsAndSavesWork(t *testing.T)
+// Space: Float("x", -1, 1). Objective simulates 81 epochs:
+//   good (x>0): loss = 1/float64(epoch); bad (x<=0): loss = 10.
+//   Reports every epoch, honors ShouldPrune (returns early).
+// ASHA{1, 81, 3}, 100 trials, seed 7. Assert:
+//   Best().Value < 0.1; ≥30% of bad-x trials Pruned;
+//   total epochs executed (count via atomic in objective) < 100*81/2.
 ```
 
 - [ ] **Step 2: Run** — FAIL.
-- [ ] **Step 3: Implement** — shared `asha` struct: `mu sync.Mutex; rungs map[int][]float64` (key = rung index `r` where resource ≥ `MinResource*η^r`); `decide(rung int, value float64, maximize bool) bool` appends value, returns whether value is within the best `ceil(n/η)` of that rung's recorded values (async ASHA: with few observations, promote by default). `Trial.Report` maps resource → highest applicable rung, calls `decide`, stores result in `t.pruneNow`; resources between rungs are no-ops (never prune there).
-- [ ] **Step 4: Run** `go test ./tune/ -race -v` — PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(tune): ASHA successive-halving pruning"`
+- [ ] **Step 3: Implement** per semantics block.
+- [ ] **Step 4: Run** — `go test ./tune/ -race -v` → PASS.
+- [ ] **Step 5: Commit** — `git add tune/ && git commit -m "feat(tune): ASHA successive-halving pruning"`
 
-### Task 3.4: Real-model example + doc
+---
+
+### Task 13: `tune` real-model example + guide
 
 **Files:**
-- Create: `examples/tune_wine.go` (match the build-tag/CLI convention of existing files in `examples/` — inspect `examples/wine_quality_clean.go` first)
+- Create: `examples/tune_wine/main.go`
 - Create: `docs/TUNE_GUIDE.md`
 
-- [ ] **Step 1: Write the example** — wine-quality dataset via existing `data` package; space: `LogFloat("lr", 1e-4, 0.5)`, `Int("hidden", 4, 64)`, `Choice("act", "relu", "tanh")`; objective builds `Network.QuickBinary`-style model from params, trains with per-epoch `Report(epoch, valLoss)`, honors `ShouldPrune`; run with `Workers: runtime.NumCPU()`, print `results.String()` top-10 and wall-clock vs. `Trials × mean-trial-time` to showcase the parallel speedup.
-- [ ] **Step 2: Run it** — `go run examples/tune_wine.go` completes in minutes and prints a sane best config (val loss below the untuned baseline from `examples/wine_quality_clean.go`).
-- [ ] **Step 3: Write `docs/TUNE_GUIDE.md`** — API walkthrough (space → objective → Run → Results), ASHA explanation with the resource/rung picture, determinism guarantees (same Seed ⇒ same params), and the "one process, all cores, no cluster" pitch.
-- [ ] **Step 4: Commit** `git commit -m "feat(tune): wine-quality tuning example + guide"`
+- [ ] **Step 1: Write the example** — follow `examples/wine_quality/main.go` for data loading (package `data`, dataset at `dataset/wine_quality/winequality-red.csv`) and model construction idioms. Space: `LogFloat("lr", 1e-4, 0.5)`, `Int("hidden", 4, 64)`, `Choice("act", "relu", "tanh")`. Objective: build `nn.Sequential` from params (seeded `nn.NewRNG(tr.Seed)`), `train.New(model, train.SGD(lr), train.BCELoss())`, train epoch-by-epoch (`train.Epochs(1)` per Fit call, or a per-epoch callback — whichever `train`'s API makes cleaner; check `train/callback.go`), `Report(epoch, valLoss)` each epoch, honor `ShouldPrune`. Config: `Trials: 60, Workers: runtime.NumCPU(), ASHA: &tune.ASHAConfig{MinResource: 2, MaxResource: 32, ReductionFactor: 4}`. Print `results.String()` top-10, total wall time, and total-epochs-executed vs. `Trials×MaxResource` to show ASHA's savings.
+- [ ] **Step 2: Verify** — `go build ./examples/tune_wine/` then `go run ./examples/tune_wine` finishes (a few minutes max) and prints a best val loss below the untuned default from `examples/wine_quality/main.go`.
+- [ ] **Step 3: Write `docs/TUNE_GUIDE.md`** — space→objective→Run→Results walkthrough; ASHA rung diagram; determinism guarantee (same Seed ⇒ same param sets regardless of scheduling); the one-process/all-cores/no-cluster pitch.
+- [ ] **Step 4: Commit** — `git add examples/tune_wine/ docs/TUNE_GUIDE.md && git commit -m "feat(tune): wine-quality tuning example + guide"`
 
 ---
 
-# Final integration task
+### Task 14: README + full-suite verification
 
-### Task 4: README + full-suite verification
-
-- [ ] **Step 1:** `go vet ./... && go test ./... -race` — all green.
-- [ ] **Step 2:** Update `README.md`: add the three features to the feature list with 5-line examples each (`neugo export` one-liner, `serve.New(...).ListenAndServe`, `tune.Run`), linking `docs/EXPORT_GUIDE.md` and `docs/TUNE_GUIDE.md`; move them out of "Future Improvements".
-- [ ] **Step 3:** Commit: `git commit -m "docs: document export/serve/tune features"`
+- [ ] **Step 1:** `go vet ./... && go build ./... && go test ./... -race` — all green.
+- [ ] **Step 2:** Update `README.md`: add Export / Serve / Tune to the feature list, each with a ≤10-line example (`neugo export` command; `serve.New` + `StartOnline` + `ListenAndServe`; `tune.Run` with ASHA), linking `docs/EXPORT_GUIDE.md` and `docs/TUNE_GUIDE.md`. Keep the existing README structure and tone.
+- [ ] **Step 3:** Commit — `git add README.md && git commit -m "docs: document export/serve/tune features"`
 
 ---
 
-## Self-review notes (already applied)
+## Self-review notes (v2)
 
-- **No invented APIs:** every `Network` symbol referenced (`ToConfig`, `NetworkFromConfig`, `QuickBinary`, `MLP`, `QuickFit`, `TrainBatch`, `LoadFromFile`, `SaveToFile`) exists today; the two that don't (`Predict`, clones) are created in Part 0 before anything uses them. One open check is flagged inline: the `examples/` build-tag convention (Tasks 2.4, 3.4).
-- **Type consistency:** `Sample`, `Config`, `modelVersion`, `Params`, `Trial`, `TrialResult` are each defined once and referenced with identical shapes across tasks.
-- **Known risks called out:** element-wise Softmax quirk (parity tests avoid it), `ForwardPass` mutation (drives the clone design), reader clones sharing weight storage (documented as load-bearing in Task 0.2).
+- Every `nn`/`train` symbol referenced was verified against the flax-restructure source: `Marshal`/`Unmarshal`/`Clone` are created in Task 1 before use; `Sequential`, `Linear`, `ReLU/Sigmoid/Tanh/Softmax`, `NewTensorFromData`, `Context/Inference`, `NewRNG`, `Save`, `train.New/SGD/BCELoss/Epochs/BatchSize/Shuffle/Seed/Fit/Evaluate`, `Metrics.Loss` all exist today. Flagged in-task checks: `nn.Conv2D` signature (Task 2 test), per-epoch training idiom (Task 13).
+- Concurrency claims verified: `LinearLayer.Forward` writes `l.input` (`nn/linear.go:57`) in all modes → clone-per-goroutine pooling is required, not optional.
+- Exactness is achievable: generated code copies the engine's op order; hex-float literals round-trip; parity asserts `==`.
