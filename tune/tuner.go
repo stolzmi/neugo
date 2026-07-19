@@ -11,9 +11,38 @@ import (
 
 // Trial represents a single trial in the search.
 type Trial struct {
-	ID     int
-	Params Params
-	Seed   int64
+	ID              int
+	Params          Params
+	Seed            int64
+	asha            *asha // shared ASHA state; internal
+	lastShouldPrune bool  // cached result of last Report decision; internal
+}
+
+// Report records an intermediate metric at a specific resource level (e.g., epoch count).
+// If ASHA is configured, it evaluates whether the trial should be pruned based on
+// how the reported value compares to other trials at the same resource level.
+//
+// Documented usage pattern:
+//
+//	for epoch := 1; epoch <= maxEpochs; epoch++ {
+//		loss = trainOneEpoch()
+//		tr.Report(epoch, loss)
+//		if tr.ShouldPrune() {
+//			return loss, nil // tuner marks the TrialResult Pruned
+//		}
+//	}
+func (t *Trial) Report(resource int, value float64) {
+	if t.asha == nil {
+		t.lastShouldPrune = false
+		return
+	}
+	t.lastShouldPrune = t.asha.report(resource, value)
+}
+
+// ShouldPrune returns true if the trial should be pruned based on the last Report decision.
+// If ASHA is not configured, always returns false.
+func (t *Trial) ShouldPrune() bool {
+	return t.lastShouldPrune
 }
 
 // Objective is a function that evaluates a trial and returns a score.
@@ -43,6 +72,9 @@ func Run(ctx context.Context, space *Space, obj Objective, cfg Config) (*Results
 		cfg.Workers = runtime.NumCPU()
 	}
 
+	// Create shared ASHA instance if configured (Task 12).
+	ashaInstance := newASHA(cfg.ASHA, cfg.Maximize)
+
 	// Step 1: Sample all trial params upfront, sequentially, deterministically.
 	r := rand.New(rand.NewSource(cfg.Seed))
 	trials := make([]*Trial, cfg.Trials)
@@ -51,6 +83,7 @@ func Run(ctx context.Context, space *Space, obj Objective, cfg Config) (*Results
 			ID:     i,
 			Params: space.Sample(r),
 			Seed:   cfg.Seed + int64(i),
+			asha:   ashaInstance,
 		}
 	}
 
@@ -89,7 +122,7 @@ func Run(ctx context.Context, space *Space, obj Objective, cfg Config) (*Results
 						Params:   trial.Params,
 						Value:    value,
 						Err:      err,
-						Pruned:   false,
+						Pruned:   trial.lastShouldPrune,
 						Duration: elapsed,
 					}
 				}
