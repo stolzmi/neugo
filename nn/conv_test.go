@@ -1,0 +1,86 @@
+// nn/conv_test.go
+package nn
+
+import "testing"
+
+func TestConv2DOutputShapeValid(t *testing.T) {
+	rng := NewRNG(1)
+	c := Conv2D(rng, 1, 4, 3, HeInit())
+	out, err := c.OutputShape([]int{2, 8, 8, 1})
+	if err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	want := []int{2, 6, 6, 4} // (8-3)/1+1 = 6
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("OutputShape = %v, want %v", out, want)
+		}
+	}
+}
+
+func TestConv2DSamePreservesSpatialDims(t *testing.T) {
+	rng := NewRNG(1)
+	c := Conv2DSame(rng, 1, 4, 3, HeInit())
+	out, err := c.OutputShape([]int{2, 8, 8, 1})
+	if err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	if out[1] != 8 || out[2] != 8 {
+		t.Fatalf("Conv2DSame output spatial dims = %v, want [.. 8 8 ..]", out)
+	}
+}
+
+func TestConv2DInputGradient(t *testing.T) {
+	rng := NewRNG(2)
+	c := Conv2D(rng, 2, 3, 3, HeInit())
+	if _, err := c.OutputShape([]int{1, 5, 5, 2}); err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	x := NewTensor([]int{1, 5, 5, 2})
+	for i := range x.Data {
+		x.Data[i] = float32(i%7)*0.1 - 0.3
+	}
+	ctx := &Context{Mode: Inference}
+	checkInputGradient(t, c, ctx, x)
+}
+
+func TestConv2DParamGradients(t *testing.T) {
+	rng := NewRNG(3)
+	c := Conv2D(rng, 2, 3, 3, HeInit())
+	if _, err := c.OutputShape([]int{1, 5, 5, 2}); err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	x := NewTensor([]int{1, 5, 5, 2})
+	for i := range x.Data {
+		x.Data[i] = float32(i%5)*0.15 - 0.3
+	}
+	ctx := &Context{Mode: Inference}
+	forward := func() (*Tensor, error) { return c.Forward(ctx, x) }
+	backward := func(g *Tensor) (*Tensor, error) { return c.Backward(ctx, g) }
+	for _, p := range c.Params() {
+		checkParamGradient(t, forward, backward, p)
+	}
+}
+
+func TestConv2DNegativePaddingReturnsErrorNotPanic(t *testing.T) {
+	rng := NewRNG(5)
+	c := newConv2D(rng, 1, 4, 3, -1, HeInit())
+	_, err := c.OutputShape([]int{2, 8, 8, 1})
+	if err == nil {
+		t.Fatal("OutputShape with negative padding returned nil error, want a clean error instead of proceeding")
+	}
+}
+
+func TestConv2DSameGradients(t *testing.T) {
+	rng := NewRNG(4)
+	c := Conv2DSame(rng, 1, 2, 3, HeInit())
+	if _, err := c.OutputShape([]int{1, 4, 4, 1}); err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	x := NewTensor([]int{1, 4, 4, 1})
+	for i := range x.Data {
+		x.Data[i] = float32(i%3)*0.2 - 0.2
+	}
+	ctx := &Context{Mode: Inference}
+	checkInputGradient(t, c, ctx, x)
+}
