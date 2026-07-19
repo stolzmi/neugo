@@ -317,3 +317,47 @@ func Load(path string) (*SequentialModel, error) {
 	}
 	return seq, nil
 }
+
+// Marshal encodes a model as JSON bytes (non-indented).
+// The output can be decoded by Unmarshal.
+func Marshal(model *SequentialModel) ([]byte, error) {
+	if model == nil {
+		return nil, fmt.Errorf("nn: Marshal: model is nil")
+	}
+	doc, err := encodeModule(model)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(doc)
+}
+
+// Unmarshal decodes JSON bytes into a SequentialModel.
+// The root module must be of type "sequential".
+func Unmarshal(data []byte) (*SequentialModel, error) {
+	var doc moduleDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("nn: Unmarshal: %w", err)
+	}
+	m, err := decodeModule(doc, NewRNG(0))
+	if err != nil {
+		return nil, err
+	}
+	seq, ok := m.(*SequentialModel)
+	if !ok {
+		return nil, fmt.Errorf("nn: Unmarshal: root module has type %q, want \"sequential\"", doc.Type)
+	}
+	return seq, nil
+}
+
+// Clone creates a fully independent deep copy of a model by marshaling
+// it to JSON and unmarshaling it back.
+func Clone(model *SequentialModel) (*SequentialModel, error) {
+	if model == nil {
+		return nil, fmt.Errorf("nn: Clone: model is nil")
+	}
+	data, err := Marshal(model)
+	if err != nil {
+		return nil, err
+	}
+	return Unmarshal(data)
+}
