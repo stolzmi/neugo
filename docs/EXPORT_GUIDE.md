@@ -15,7 +15,7 @@ import (
 
 func main() {
 	rng := nn.NewRNG(42)
-	m, _ := nn.Sequential([]int{784, 128, 10},
+	m, _ := nn.Sequential([]int{1, 784},
 		nn.Linear(rng, 784, 128, nil), nn.ReLU(),
 		nn.Linear(rng, 128, 10, nil), nn.Softmax(),
 	)
