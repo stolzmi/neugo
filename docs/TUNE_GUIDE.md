@@ -243,7 +243,7 @@ See `examples/tune_wine/main.go` for a complete example:
 1. **Load data** — CSV with normalization.
 2. **Create space** — LogFloat for learning rate, Int for hidden size, Choice for activation.
 3. **Define objective** — Build Sequential model, train epoch-by-epoch, report validation loss.
-4. **Run search** — 60 trials, ASHA pruning with 5 rungs.
+4. **Run search** — 60 trials, ASHA pruning with 3 rungs.
 5. **Display results** — Best parameters and ASHA efficiency stats.
 
 ```bash
@@ -259,8 +259,8 @@ Best validation loss: 0.2139
   Activation: tanh
 
 === ASHA Efficiency ===
-Wall time: 4.4s
-Total epochs executed: 485 (vs. 1920 possible)
+Wall time: 3.6s
+Total epochs executed: 534 (vs. 1920 possible)
 ASHA pruning efficiency: 25.3% (lower = more aggressive)
 ```
 
