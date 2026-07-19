@@ -126,4 +126,3 @@ func TestGenerateGoRejectsChainMismatch(t *testing.T) {
 		t.Fatalf("want error about width mismatch, got %v", err)
 	}
 }
-

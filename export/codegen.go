@@ -61,8 +61,8 @@ func GenerateGo(modelJSON []byte, opts Options) ([]byte, error) {
 	var body bytes.Buffer
 
 	varIndex := 0
-	inputDim := -1     // Captured from first linear layer's in_features
-	outputDim := -1    // Captured from last linear layer's out_features
+	inputDim := -1      // Captured from first linear layer's in_features
+	outputDim := -1     // Captured from last linear layer's out_features
 	prevLinearOut := -1 // For chain-width validation
 
 	for _, mod := range root.Modules {
