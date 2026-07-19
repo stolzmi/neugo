@@ -77,7 +77,7 @@ func main() {
 
 	fmt.Println("\n=== Server started on :8080 ===")
 	fmt.Println("\nCurl walkthrough:")
-	fmt.Println(`
+	fmt.Print(`
 
 # 1. Make a prediction
 curl -X POST http://localhost:8080/predict \
