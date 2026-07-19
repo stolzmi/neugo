@@ -2,10 +2,15 @@ package tune
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"sort"
 	"text/tabwriter"
 	"time"
 )
+
+// ErrNotRun is a sentinel error indicating a trial was never run (e.g., due to context cancellation).
+var ErrNotRun = errors.New("tune: trial not run (cancelled before dispatch)")
 
 // TrialResult represents the outcome of a single trial.
 type TrialResult struct {
@@ -66,12 +71,19 @@ func paramsToString(p Params) string {
 	if len(p) == 0 {
 		return ""
 	}
+	// Sort keys for stable output
+	keys := make([]string, 0, len(p))
+	for k := range p {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	var buf bytes.Buffer
-	first := true
-	for k, v := range p {
-		if !first {
+	for i, k := range keys {
+		if i > 0 {
 			buf.WriteString(", ")
 		}
+		v := p[k]
 		fmt.Fprintf(&buf, "%s=", k)
 		switch val := v.(type) {
 		case float64:
@@ -83,7 +95,6 @@ func paramsToString(p Params) string {
 		default:
 			fmt.Fprintf(&buf, "%v", val)
 		}
-		first = false
 	}
 	return buf.String()
 }

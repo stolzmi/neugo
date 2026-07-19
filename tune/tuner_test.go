@@ -170,6 +170,34 @@ func TestRunHonorsContext(t *testing.T) {
 	if results == nil {
 		t.Errorf("Results should be non-nil on cancellation")
 	}
+
+	// Key assertion: results must be sorted and never-run trials must be distinguishable.
+	// If any trial completed successfully (Err == nil && !Pruned), Best() must return one of those.
+	// Otherwise, all trials must have ErrNotRun.
+	completedCount := 0
+	for _, tr := range results.Trials {
+		if tr.Err == nil && !tr.Pruned {
+			completedCount++
+		}
+	}
+
+	if completedCount > 0 {
+		// At least one trial completed; Best() must return a completed trial.
+		best := results.Best()
+		if best.Err != nil {
+			t.Errorf("Best() returned a trial with Err=%v, but completed trials exist", best.Err)
+		}
+		if best.Pruned {
+			t.Errorf("Best() returned a pruned trial, but non-pruned completed trials exist")
+		}
+	} else {
+		// No trials completed; all must have ErrNotRun.
+		for _, tr := range results.Trials {
+			if !errors.Is(tr.Err, ErrNotRun) {
+				t.Errorf("Trial %d has Err=%v, expected ErrNotRun (or nil only if completed)", tr.ID, tr.Err)
+			}
+		}
+	}
 }
 
 func TestMaximize(t *testing.T) {

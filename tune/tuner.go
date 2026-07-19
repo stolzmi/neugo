@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 )
@@ -54,9 +55,11 @@ func Run(ctx context.Context, space *Space, obj Objective, cfg Config) (*Results
 	}
 
 	// Step 2: Create results array with disjoint indices (no mutex needed).
+	// Pre-populate with ErrNotRun so cancelled (never-run) trials are distinguishable.
 	results := make([]TrialResult, cfg.Trials)
 	for i := 0; i < cfg.Trials; i++ {
 		results[i].ID = i
+		results[i].Err = ErrNotRun
 	}
 
 	// Step 3: Feed trials through a channel to workers.
@@ -111,6 +114,7 @@ func Run(ctx context.Context, space *Space, obj Objective, cfg Config) (*Results
 
 	// Check if context was cancelled.
 	if ctx.Err() != nil {
+		sortResults(results, cfg.Maximize)
 		return &Results{Trials: results}, ctx.Err()
 	}
 
@@ -132,24 +136,16 @@ func sortResults(results []TrialResult, maximize bool) {
 		}
 	}
 
-	// Sort the good trials.
+	// Sort the good trials using sort.Slice.
 	if maximize {
 		// Sort descending by value.
-		for i := 0; i < good; i++ {
-			for j := i + 1; j < good; j++ {
-				if results[j].Value > results[i].Value {
-					results[i], results[j] = results[j], results[i]
-				}
-			}
-		}
+		sort.Slice(results[:good], func(i, j int) bool {
+			return results[i].Value > results[j].Value
+		})
 	} else {
 		// Sort ascending by value.
-		for i := 0; i < good; i++ {
-			for j := i + 1; j < good; j++ {
-				if results[j].Value < results[i].Value {
-					results[i], results[j] = results[j], results[i]
-				}
-			}
-		}
+		sort.Slice(results[:good], func(i, j int) bool {
+			return results[i].Value < results[j].Value
+		})
 	}
 }
