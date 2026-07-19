@@ -37,13 +37,14 @@ type modelVersion struct {
 }
 
 // Server is a lock-free HTTP server for model inference.
-// swapMu guards swapIn only — the predict path is lock-free and must NOT touch it.
+// swapMu guards swapIn and Rollback only — the predict path is lock-free and must NOT touch it.
 type Server struct {
-	current  *atomic.Pointer[modelVersion]
-	cfg      Config
-	metrics  *metrics
-	swapMu   sync.Mutex // guards swapIn only; serializes model swaps to keep generations unique
-	feedback chan Sample // buffered channel for online learning feedback
+	current   *atomic.Pointer[modelVersion]
+	previous  *atomic.Pointer[modelVersion]
+	cfg       Config
+	metrics   *metrics
+	swapMu    sync.Mutex // guards swapIn and Rollback only; serializes model swaps to keep generations unique
+	feedback  chan Sample // buffered channel for online learning feedback
 }
 
 // New creates a new Server from a model and config.
@@ -90,11 +91,15 @@ func New(model *nn.SequentialModel, cfg Config) (*Server, error) {
 	ptr := &atomic.Pointer[modelVersion]{}
 	ptr.Store(ver)
 
+	prevPtr := &atomic.Pointer[modelVersion]{}
+	prevPtr.Store(nil) // no previous version initially
+
 	return &Server{
-		current:  ptr,
-		cfg:      cfg,
-		metrics:  &metrics{},
-		feedback: make(chan Sample, 4096),
+		current:   ptr,
+		previous:  prevPtr,
+		cfg:       cfg,
+		metrics:   &metrics{},
+		feedback:  make(chan Sample, 4096),
 	}, nil
 }
 
@@ -104,6 +109,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /predict", s.handlePredict)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("POST /feedback", s.handleFeedback)
+	mux.HandleFunc("POST /admin/rollback", s.handleRollback)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	return mux
 }
 
@@ -161,8 +168,47 @@ func (s *Server) Generation() uint64 {
 	return ver.gen
 }
 
+// Rollback exchanges current and previous model versions and installs the restored version
+// as a new monotonic generation. Returns the new generation number.
+// Returns 0 and an error if there is no previous version.
+func (s *Server) Rollback() (uint64, error) {
+	s.swapMu.Lock()
+	defer s.swapMu.Unlock()
+
+	prevVer := s.previous.Load()
+	if prevVer == nil {
+		return 0, fmt.Errorf("serve: no previous version to rollback to")
+	}
+
+	// Current and previous swap roles: we use previous's doc as the new generation
+	currentVer := s.current.Load()
+	newGen := currentVer.gen + 1
+
+	// Create new model version from previous's doc
+	newVer := &modelVersion{
+		gen: newGen,
+		doc: prevVer.doc,
+	}
+	newVer.pool.New = func() any {
+		m, err := nn.Unmarshal(newVer.doc)
+		if err != nil {
+			panic(fmt.Sprintf("serve: failed to unmarshal model: %v", err))
+		}
+		return m
+	}
+
+	// Install the restored version as current, and current becomes previous
+	s.previous.Store(currentVer)
+	s.current.Store(newVer)
+	s.metrics.swapTotal.Add(1)
+	s.metrics.modelGen.Store(newGen)
+
+	return newGen, nil
+}
+
 // swapIn installs a new model generation from marshaled bytes.
 // Lock serializes this to keep generations unique and monotonic.
+// The displaced current version is stored in previous.
 func (s *Server) swapIn(doc []byte) {
 	s.swapMu.Lock()
 	defer s.swapMu.Unlock()
@@ -182,6 +228,9 @@ func (s *Server) swapIn(doc []byte) {
 		}
 		return m
 	}
+
+	// Store the displaced version as previous before swapping
+	s.previous.Store(oldVer)
 
 	// Atomically swap (old version stays valid for in-flight requests)
 	s.current.Store(newVer)
@@ -273,4 +322,27 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+}
+
+// handleRollback handles POST /admin/rollback requests.
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	gen, err := s.Rollback()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"model_gen": gen,
+	})
+}
+
+// handleMetrics handles GET /metrics requests.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	s.metrics.writePrometheus(w)
 }
