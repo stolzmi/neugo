@@ -176,3 +176,46 @@ func TestPredictConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestSwapConcurrentGenerationsUnique(t *testing.T) {
+	s := newTestServer(t)
+
+	// Capture the initial doc from the server's current model
+	initialVer := s.current.Load()
+	doc := initialVer.doc
+
+	// Verify we start at generation 1
+	if s.Generation() != 1 {
+		t.Fatalf("Expected initial generation 1, got %d", s.Generation())
+	}
+
+	// Run 8 goroutines, each calling swapIn 25 times (200 total)
+	const numGoroutines = 8
+	const swapsPerGoroutine = 25
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < swapsPerGoroutine; j++ {
+				s.swapIn(doc)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// After all swaps, generation should be 1 + 200 = 201
+	expectedGen := uint64(1 + numGoroutines*swapsPerGoroutine)
+	finalGen := s.Generation()
+	if finalGen != expectedGen {
+		t.Fatalf("Expected generation %d, got %d", expectedGen, finalGen)
+	}
+
+	// Verify metrics.modelGen matches
+	metricsGen := s.metrics.modelGen.Load()
+	if metricsGen != expectedGen {
+		t.Fatalf("Expected metrics.modelGen %d, got %d", expectedGen, metricsGen)
+	}
+}

@@ -37,10 +37,12 @@ type modelVersion struct {
 }
 
 // Server is a lock-free HTTP server for model inference.
+// swapMu guards swapIn only — the predict path is lock-free and must NOT touch it.
 type Server struct {
 	current *atomic.Pointer[modelVersion]
 	cfg     Config
 	metrics *metrics
+	swapMu  sync.Mutex // guards swapIn only; serializes model swaps to keep generations unique
 }
 
 // New creates a new Server from a model and config.
@@ -157,7 +159,11 @@ func (s *Server) Generation() uint64 {
 }
 
 // swapIn installs a new model generation from marshaled bytes.
+// Lock serializes this to keep generations unique and monotonic.
 func (s *Server) swapIn(doc []byte) {
+	s.swapMu.Lock()
+	defer s.swapMu.Unlock()
+
 	oldVer := s.current.Load()
 	newGen := oldVer.gen + 1
 
@@ -186,6 +192,7 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 		Input []float32 `json:"input"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("invalid JSON: %v", err)})
 		return
@@ -193,6 +200,7 @@ func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
 
 	output, gen, err := s.Predict(req.Input)
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
