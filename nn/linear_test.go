@@ -1,0 +1,52 @@
+// nn/linear_test.go
+package nn
+
+import "testing"
+
+func TestLinearForwardShape(t *testing.T) {
+	rng := NewRNG(1)
+	l := Linear(rng, 3, 4, XavierInit())
+	x, _ := NewTensorFromData([]float32{1, 2, 3, 4, 5, 6}, []int{2, 3})
+	ctx := &Context{Mode: Inference}
+	y, err := l.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	if y.Shape[0] != 2 || y.Shape[1] != 4 {
+		t.Fatalf("output shape = %v, want [2 4]", y.Shape)
+	}
+}
+
+func TestLinearOutputShapeInfersInFeatures(t *testing.T) {
+	rng := NewRNG(1)
+	l := Linear(rng, 0, 5, XavierInit())
+	out, err := l.OutputShape([]int{8, 12})
+	if err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	if out[0] != 8 || out[1] != 5 {
+		t.Fatalf("OutputShape = %v, want [8 5]", out)
+	}
+	if len(l.Params()) != 2 || l.Params()[0].Value.Shape[0] != 12 {
+		t.Fatalf("Linear did not build W with inferred inFeatures=12: %+v", l.Params()[0].Value.Shape)
+	}
+}
+
+func TestLinearInputGradient(t *testing.T) {
+	rng := NewRNG(2)
+	l := Linear(rng, 3, 2, XavierInit())
+	x, _ := NewTensorFromData([]float32{0.5, -1.2, 0.3, 1.1, 0.2, -0.7}, []int{2, 3})
+	ctx := &Context{Mode: Inference}
+	checkInputGradient(t, l, ctx, x)
+}
+
+func TestLinearParamGradients(t *testing.T) {
+	rng := NewRNG(3)
+	l := Linear(rng, 3, 2, XavierInit())
+	x, _ := NewTensorFromData([]float32{0.5, -1.2, 0.3, 1.1, 0.2, -0.7}, []int{2, 3})
+	ctx := &Context{Mode: Inference}
+	forward := func() (*Tensor, error) { return l.Forward(ctx, x) }
+	backward := func(g *Tensor) (*Tensor, error) { return l.Backward(ctx, g) }
+	checkParamGradient(t, forward, backward, l.Params()[0]) // W
+	checkParamGradient(t, forward, backward, l.Params()[1]) // B
+}
