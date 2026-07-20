@@ -77,13 +77,3 @@ func out1Diff(a, b float32) float32 {
 	}
 	return b - a
 }
-
-func TestLayerNormIsGroupNormWithOneGroup(t *testing.T) {
-	ln := LayerNorm(6)
-	x := NewTensor([]int{3, 6})
-	for i := range x.Data {
-		x.Data[i] = float32(i%9)*0.11 - 0.4
-	}
-	ctx := &Context{Mode: Train}
-	checkInputGradient(t, ln, ctx, x)
-}

@@ -221,6 +221,41 @@ func TestSaveLoadGroupNormRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSaveLoadLayerNormRoundTrip(t *testing.T) {
+	l := LayerNorm(4)
+	x := NewTensor([]int{2, 3, 4})
+	for i := range x.Data {
+		x.Data[i] = float32(i%7) * 0.15
+	}
+	ctx := &Context{Mode: Train}
+	want, err := l.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{2, 3, 4}, l)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "layernorm.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
 func TestSaveLoadEmbeddingRoundTrip(t *testing.T) {
 	rng := NewRNG(11)
 	e := Embedding(rng, 6, 3, NormalInit(0, 0.5))
@@ -622,5 +657,116 @@ func TestSaveNilModelReturnsError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nil_model.json")
 	if err := Save(nil, path); err == nil {
 		t.Fatal("expected error saving a nil model, got nil")
+	}
+}
+
+func TestSaveLoadPositionalEmbeddingRoundTrip(t *testing.T) {
+	rng := NewRNG(18)
+	p := PositionalEmbedding(rng, 5, 3, NormalInit(0, 0.1))
+	model, err := Sequential([]int{1, 3, 3}, p)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	x := NewTensor([]int{1, 3, 3})
+	for i := range x.Data {
+		x.Data[i] = float32(i%4) * 0.2
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := model.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "positional.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadTransformerBlockRoundTrip(t *testing.T) {
+	rng := NewRNG(19)
+	block, err := TransformerBlock(rng, 4, 2, 8, true, XavierInit())
+	if err != nil {
+		t.Fatalf("TransformerBlock: %v", err)
+	}
+	model, err := Sequential([]int{1, 3, 4}, block)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	x := NewTensor([]int{1, 3, 4})
+	for i := range x.Data {
+		x.Data[i] = float32(i%5) * 0.2
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := model.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "transformerblock.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadMultiHeadAttentionRoundTrip(t *testing.T) {
+	rng := NewRNG(17)
+	m := MultiHeadAttention(rng, 4, 2, true, XavierInit())
+	model, err := Sequential([]int{1, 3, 4}, m)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	x := NewTensor([]int{1, 3, 4})
+	for i := range x.Data {
+		x.Data[i] = float32(i%5) * 0.2
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := model.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "attention.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
 	}
 }

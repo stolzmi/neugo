@@ -36,70 +36,76 @@ func (l *LinearLayer) build(inFeatures int) {
 }
 
 func (l *LinearLayer) OutputShape(inShape []int) ([]int, error) {
-	if len(inShape) != 2 {
-		return nil, fmt.Errorf("nn: Linear expects input shape [batch, features], got %v", inShape)
+	if len(inShape) < 2 {
+		return nil, fmt.Errorf("nn: Linear expects input shape [..., features] with at least 2 dims, got %v", inShape)
 	}
-	in := inShape[1]
+	in := inShape[len(inShape)-1]
 	if l.inFeatures == 0 {
 		l.build(in)
 	} else if l.inFeatures != in {
 		return nil, fmt.Errorf("nn: Linear configured for %d input features, got %d", l.inFeatures, in)
 	}
-	return []int{inShape[0], l.outFeatures}, nil
+	outShape := append([]int(nil), inShape[:len(inShape)-1]...)
+	return append(outShape, l.outFeatures), nil
 }
 
+// Forward treats every leading dimension as an effective batch ("rows" =
+// their product) and the last dimension as features — the physical
+// layout already has features as the contiguous, fastest-varying axis
+// regardless of rank, so a [batch, seqLen, features] tensor's rows are
+// exactly as row-major-contiguous as a plain [batch, features] tensor's,
+// and the per-row loop below is unchanged from the old 2D-only version.
 func (l *LinearLayer) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
 	if l.W == nil {
 		return nil, fmt.Errorf("nn: Linear not built — call OutputShape or construct via Sequential first")
 	}
-	if len(x.Shape) != 2 || x.Shape[1] != l.inFeatures {
-		return nil, fmt.Errorf("nn: Linear expected input shape [batch, %d], got %v", l.inFeatures, x.Shape)
+	if len(x.Shape) < 2 || x.Shape[len(x.Shape)-1] != l.inFeatures {
+		return nil, fmt.Errorf("nn: Linear expected input shape [..., %d], got %v", l.inFeatures, x.Shape)
 	}
 	l.input = x
-	batch := x.Shape[0]
-	out := NewTensor([]int{batch, l.outFeatures})
-	// Batch-parallel: out rows are per-b disjoint; W/B are read-only here.
-	parallelChunks(batch, func(_, bStart, bEnd int) {
-		for b := bStart; b < bEnd; b++ {
+	rows := len(x.Data) / l.inFeatures
+	outShape := append([]int(nil), x.Shape[:len(x.Shape)-1]...)
+	outShape = append(outShape, l.outFeatures)
+	out := NewTensor(outShape)
+	// Row-parallel: out rows are per-row disjoint; W/B are read-only here.
+	parallelChunks(rows, func(_, rStart, rEnd int) {
+		for r := rStart; r < rEnd; r++ {
 			for o := 0; o < l.outFeatures; o++ {
 				sum := l.B.Value.Data[o]
 				for i := 0; i < l.inFeatures; i++ {
-					sum += x.Data[b*l.inFeatures+i] * l.W.Value.Data[i*l.outFeatures+o]
+					sum += x.Data[r*l.inFeatures+i] * l.W.Value.Data[i*l.outFeatures+o]
 				}
-				out.Data[b*l.outFeatures+o] = sum
+				out.Data[r*l.outFeatures+o] = sum
 			}
 		}
 	})
 	return out, nil
 }
 
-// Backward implements plain chain rule with no extra batch normalization:
-// gradOut already carries whatever batch-scaling the Loss applied (see
-// Task 7), so W.Grad/B.Grad are raw sums over the batch, exactly like
-// gradIn — introducing an additional /batch here would silently shrink
-// every parameter gradient by a factor of batch and fail the Task 4
-// gradient-check tests.
+// Backward implements plain chain rule with no extra batch normalization
+// (see design decision #6 in the original plan header) — W.Grad/B.Grad
+// are raw sums over rows, exactly like gradIn.
 func (l *LinearLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
-	batch := l.input.Shape[0]
-	gradIn := NewTensor([]int{batch, l.inFeatures})
+	rows := len(l.input.Data) / l.inFeatures
+	gradIn := NewTensor(l.input.Shape)
 	l.W.ZeroGrad()
 	l.B.ZeroGrad()
-	// Batch-parallel: gradIn rows are per-b disjoint; shared W/B gradients
+	// Row-parallel: gradIn rows are per-row disjoint; shared W/B gradients
 	// accumulate into per-chunk partials reduced in chunk order below.
-	numChunks := len(chunkRanges(batch, runtime.GOMAXPROCS(0)))
+	numChunks := len(chunkRanges(rows, runtime.GOMAXPROCS(0)))
 	wPartials := make([][]float32, numChunks)
 	bPartials := make([][]float32, numChunks)
-	parallelChunks(batch, func(chunk, bStart, bEnd int) {
+	parallelChunks(rows, func(chunk, rStart, rEnd int) {
 		wGrad := make([]float32, len(l.W.Grad.Data))
 		bGrad := make([]float32, len(l.B.Grad.Data))
 		wPartials[chunk], bPartials[chunk] = wGrad, bGrad
-		for b := bStart; b < bEnd; b++ {
+		for r := rStart; r < rEnd; r++ {
 			for o := 0; o < l.outFeatures; o++ {
-				g := gradOut.Data[b*l.outFeatures+o]
+				g := gradOut.Data[r*l.outFeatures+o]
 				bGrad[o] += g
 				for i := 0; i < l.inFeatures; i++ {
-					wGrad[i*l.outFeatures+o] += g * l.input.Data[b*l.inFeatures+i]
-					gradIn.Data[b*l.inFeatures+i] += g * l.W.Value.Data[i*l.outFeatures+o]
+					wGrad[i*l.outFeatures+o] += g * l.input.Data[r*l.inFeatures+i]
+					gradIn.Data[r*l.inFeatures+i] += g * l.W.Value.Data[i*l.outFeatures+o]
 				}
 			}
 		}

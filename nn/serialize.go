@@ -57,6 +57,10 @@ type groupNormConfig struct {
 	Channels int `json:"channels"`
 }
 
+type layerNormConfig struct {
+	Channels int `json:"channels"`
+}
+
 type embeddingConfig struct {
 	VocabSize int `json:"vocab_size"`
 	EmbedDim  int `json:"embed_dim"`
@@ -80,6 +84,17 @@ type convTranspose2DConfig struct {
 
 type leakyReLUConfig struct {
 	Alpha float32 `json:"alpha"`
+}
+
+type multiHeadAttentionConfig struct {
+	DModel   int  `json:"d_model"`
+	NumHeads int  `json:"num_heads"`
+	Causal   bool `json:"causal"`
+}
+
+type positionalEmbeddingConfig struct {
+	MaxLen int `json:"max_len"`
+	DModel int `json:"d_model"`
 }
 
 func mustMarshal(v any) json.RawMessage {
@@ -121,6 +136,12 @@ func encodeModule(m Module) (moduleDoc, error) {
 			Config: mustMarshal(groupNormConfig{Groups: v.groups, Channels: v.channels}),
 			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma), "beta": toParamDoc(v.Beta)},
 		}, nil
+	case *LayerNormLayer:
+		return moduleDoc{
+			Type:   "layernorm",
+			Config: mustMarshal(layerNormConfig{Channels: v.channels}),
+			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma), "beta": toParamDoc(v.Beta)},
+		}, nil
 	case *EmbeddingLayer:
 		return moduleDoc{
 			Type:   "embedding",
@@ -138,6 +159,38 @@ func encodeModule(m Module) (moduleDoc, error) {
 			Type:   "convtranspose2d",
 			Config: mustMarshal(convTranspose2DConfig{InChannels: v.inChannels, OutChannels: v.outChannels, KernelSize: v.kernelSize, Padding: v.padding, Stride: v.stride}),
 			Params: map[string]paramDoc{"W": toParamDoc(v.W), "B": toParamDoc(v.B)},
+		}, nil
+	case *MultiHeadAttentionLayer:
+		wqDoc, err := encodeModule(v.wq)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		wkDoc, err := encodeModule(v.wk)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		wvDoc, err := encodeModule(v.wv)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		woDoc, err := encodeModule(v.wo)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		return moduleDoc{
+			Type:    "multihead_attention",
+			Config:  mustMarshal(multiHeadAttentionConfig{DModel: v.dModel, NumHeads: v.numHeads, Causal: v.causal}),
+			Modules: []moduleDoc{wqDoc, wkDoc, wvDoc, woDoc},
+		}, nil
+	case *PositionalEmbeddingLayer:
+		embedDoc, err := encodeModule(v.embed)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		return moduleDoc{
+			Type:    "positional_embedding",
+			Config:  mustMarshal(positionalEmbeddingConfig{MaxLen: v.maxLen, DModel: v.dModel}),
+			Modules: []moduleDoc{embedDoc},
 		}, nil
 	case *FrozenModule:
 		innerDoc, err := encodeModule(v.inner)
@@ -375,6 +428,33 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		copy(gn.Beta.Value.Data, beta.Data)
 		return gn, nil
 
+	case "layernorm":
+		var cfg layerNormConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: layernorm config: %w", err)
+		}
+		if cfg.Channels <= 0 {
+			return nil, fmt.Errorf("nn: Load: layernorm config: channels must be positive, got %d", cfg.Channels)
+		}
+		ln := LayerNorm(cfg.Channels)
+		gamma, err := paramOrErr(doc, "gamma", "layernorm")
+		if err != nil {
+			return nil, err
+		}
+		beta, err := paramOrErr(doc, "beta", "layernorm")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("layernorm", "gamma", len(ln.Gamma.Value.Data), gamma); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("layernorm", "beta", len(ln.Beta.Value.Data), beta); err != nil {
+			return nil, err
+		}
+		copy(ln.Gamma.Value.Data, gamma.Data)
+		copy(ln.Beta.Value.Data, beta.Data)
+		return ln, nil
+
 	case "embedding":
 		var cfg embeddingConfig
 		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
@@ -450,6 +530,55 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		copy(c.W.Value.Data, w.Data)
 		copy(c.B.Value.Data, b.Data)
 		return c, nil
+
+	case "multihead_attention":
+		var cfg multiHeadAttentionConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: multihead_attention config: %w", err)
+		}
+		if cfg.DModel <= 0 || cfg.NumHeads <= 0 || cfg.DModel%cfg.NumHeads != 0 {
+			return nil, fmt.Errorf("nn: Load: multihead_attention config: d_model %d must be positive and evenly divisible by num_heads %d", cfg.DModel, cfg.NumHeads)
+		}
+		if len(doc.Modules) != 4 {
+			return nil, fmt.Errorf("nn: Load: multihead_attention must have 4 nested modules (wq,wk,wv,wo), got %d", len(doc.Modules))
+		}
+		names := [4]string{"wq", "wk", "wv", "wo"}
+		linears := [4]*LinearLayer{}
+		for i, name := range names {
+			mod, err := decodeModule(doc.Modules[i], rng)
+			if err != nil {
+				return nil, err
+			}
+			lin, ok := mod.(*LinearLayer)
+			if !ok {
+				return nil, fmt.Errorf("nn: Load: multihead_attention %s must be a linear module", name)
+			}
+			linears[i] = lin
+		}
+		m := MultiHeadAttention(rng, cfg.DModel, cfg.NumHeads, cfg.Causal, ZerosInit())
+		m.wq, m.wk, m.wv, m.wo = linears[0], linears[1], linears[2], linears[3]
+		return m, nil
+
+	case "positional_embedding":
+		var cfg positionalEmbeddingConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: positional_embedding config: %w", err)
+		}
+		if cfg.MaxLen <= 0 || cfg.DModel <= 0 {
+			return nil, fmt.Errorf("nn: Load: positional_embedding config: max_len and d_model must be positive, got %d and %d", cfg.MaxLen, cfg.DModel)
+		}
+		if len(doc.Modules) != 1 {
+			return nil, fmt.Errorf("nn: Load: positional_embedding must have 1 nested module, got %d", len(doc.Modules))
+		}
+		embedMod, err := decodeModule(doc.Modules[0], rng)
+		if err != nil {
+			return nil, err
+		}
+		embedL, ok := embedMod.(*EmbeddingLayer)
+		if !ok {
+			return nil, fmt.Errorf("nn: Load: positional_embedding nested module must be an embedding module")
+		}
+		return &PositionalEmbeddingLayer{maxLen: cfg.MaxLen, dModel: cfg.DModel, embed: embedL}, nil
 
 	case "frozen":
 		if len(doc.Modules) != 1 {

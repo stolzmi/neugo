@@ -29,8 +29,14 @@ func moduleTypeName(m Module) string {
 		return "Residual"
 	case *GroupNormLayer:
 		return "GroupNorm"
+	case *LayerNormLayer:
+		return "LayerNorm"
 	case *EmbeddingLayer:
 		return "Embedding"
+	case *MultiHeadAttentionLayer:
+		return "MultiHeadAttention"
+	case *PositionalEmbeddingLayer:
+		return "PositionalEmbedding"
 	case *Conv1DLayer:
 		return "Conv1D"
 	case *ConvTranspose2DLayer:

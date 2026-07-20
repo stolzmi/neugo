@@ -1,11 +1,12 @@
 # NeuGo
 
-A zero-dependency neural network library for Go. Everything is a
-`Module` — dense layers, convolutions, pooling, dropout, batch norm, and
-activations all compose the same way, and one `Trainer` handles fitting,
-prediction, and evaluation for both. Trained models can be exported to
-standalone Go source, served over HTTP with hot-swap and online learning,
-and tuned with parallel hyperparameter search.
+A dependency-free neural network library for Go. Everything is a
+`Module` — dense layers, convolutions, normalization, attention, and
+activations all compose the same way through `Sequential`, and one
+`Trainer` handles fitting, prediction, and evaluation for all of them.
+Trained models can be exported to standalone Go source, served over
+HTTP with hot-swap and online learning, and tuned with parallel
+hyperparameter search.
 
 ## Install
 
@@ -57,10 +58,16 @@ Nine runnable examples live in `examples/` — run any of them with
 - `wine_quality` — a real dataset (`dataset/wine_quality/winequality-red.csv`).
 - `fashion_mnist` — convolutional; falls back to synthetic data unless
   you've downloaded a Fashion-MNIST CSV yourself.
-- `cifar10_cnn` / `cifar100_cnn` — convolutional; each downloads and
-  extracts the real dataset from `cs.toronto.edu` on first run
-  (~170MB/~160MB), training on a capped subset for speed, and falls back
-  to synthetic data if the download fails (e.g. no network).
+- `cifar10_cnn` — the showcase example: a BatchNorm/Dropout/GELU CNN
+  with flip augmentation, cosine LR annealing, early stopping, and
+  metadata-bundled checkpointing, trained on the full 50k-image dataset
+  plus the official test batch (downloaded from `cs.toronto.edu` on
+  first run, ~170MB). Pass `-quick` for a fast smoke-test path (one
+  batch, 5k images, no augmentation) instead of the full run.
+- `cifar100_cnn` — convolutional; downloads and extracts the real
+  dataset (~160MB) on first run, training on a capped subset for speed,
+  and falls back to synthetic data if the download fails (e.g. no
+  network).
 - `callbacks` — early stopping, checkpointing, LR scheduling, progress
   reporting.
 - `crossval` — k-fold cross-validation.
@@ -69,17 +76,36 @@ Nine runnable examples live in `examples/` — run any of them with
 
 ## Features
 
-- **Modules** (`nn`): `Linear`, `Conv2D`/`Conv2DSame`, `MaxPool2D`,
-  `AvgPool2D`, `Flatten`, `Dropout`, `BatchNorm`, activations (`ReLU`,
-  `Sigmoid`, `Tanh`, `LeakyReLU`, `GELU`, `Softmax`) — all compose via
-  `Sequential`, which validates the whole chain's shapes at construction.
+- **Modules** (`nn`): `Linear` (rank-agnostic — accepts any `[...,
+  features]` input, not just `[batch, features]`), `Conv2D`/
+  `Conv2DSame`/`Conv2DStrided`, `Conv1D`/`Conv1DSame`/`Conv1DStrided`,
+  `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D`, `Flatten`, `Dropout`,
+  `BatchNorm`, `LayerNorm`, `GroupNorm`, `Embedding`, activations
+  (`ReLU`, `Sigmoid`, `Tanh`, `LeakyReLU`, `GELU`, `Softmax`) — all
+  compose via `Sequential`, which validates the whole chain's shapes at
+  construction.
+- **Composite modules**: `Residual(shortcut, inner...)` for ResNet-style
+  skip connections (identity or projection shortcut); `Frozen(module)`
+  excludes a layer's weights from optimizer updates for fine-tuning,
+  while gradients still flow through it to earlier layers.
+- **Attention** (`nn`): `MultiHeadAttention` (self-attention, causal or
+  non-causal masking, implements `Module` so it composes normally),
+  `CrossAttention` (query/context attention with independent sequence
+  lengths — takes two inputs, so it's called directly rather than
+  composed via `Sequential`), `PositionalEmbedding`, and
+  `TransformerBlock` — a constructor (not a new type) assembling a full
+  attention + feed-forward encoder block from the above; since it
+  returns a `*SequentialModel`, which already implements `Module`,
+  blocks stack by simply listing several `TransformerBlock(...)` calls
+  inside an outer `Sequential`.
 - **Initializers**: Xavier, He, Zeros, Uniform, Normal — explicit
   `*rand.Rand` throughout, no global RNG state anywhere in the library.
 - **Training** (`train`): one `Trainer.Fit` loop with per-epoch shuffling,
   batching, optional gradient clipping, and validation metrics.
-  Optimizers: SGD, Momentum, Adam, RMSprop, plus a `ClipNorm` wrapper.
-  Losses: MSE, MAE, BCE, CrossEntropy (with a fused softmax+cross-entropy
-  gradient shortcut when the model ends in `Softmax`).
+  Optimizers: SGD, Momentum, Adam, AdamW (decoupled weight decay),
+  RMSprop, plus a `ClipNorm` wrapper. Losses: MSE, MAE, BCE,
+  CrossEntropy (with a fused softmax+cross-entropy gradient shortcut
+  when the model ends in `Softmax`).
 - **Callbacks**: `History` (always returned by `Fit`), `EarlyStopping`
   (with in-memory best-weight restore), `ModelCheckpoint`, `ProgressBar`,
   and five LR schedulers (`StepDecay`, `ExponentialDecay`,
@@ -87,14 +113,25 @@ Nine runnable examples live in `examples/` — run any of them with
 - **Evaluation**: `Trainer.Evaluate` returns accuracy/precision/recall/F1/
   confusion-matrix `Metrics`, macro-averaged for multiclass;
   `train.KFoldSplits`/`StratifiedKFoldSplits`/`CrossValidate` for
-  cross-validation.
-- **Serialization**: `nn.Save`/`nn.Load` — one JSON format for any module
-  tree, dense or convolutional; `Marshal`/`Unmarshal`/`Clone` for
-  in-memory copies.
+  cross-validation; `train.FormatConfusionMatrix` and `History.PlotLoss`
+  for terminal-friendly reporting.
+- **Serialization**: `nn.Save`/`nn.Load` — one JSON format for any
+  module tree, from a single dense layer to a full Transformer block;
+  `nn.SaveWithMetadata`/`nn.LoadWithMetadata` additionally bundle input
+  shape, class names, and per-channel normalization stats with the
+  weights, so a saved file is self-sufficient for inference; `Marshal`/
+  `Unmarshal`/`Clone` for in-memory copies.
+- **Performance**: the hot paths in `Conv2D`, `Conv1D`, `Linear`,
+  `BatchNorm`/`GroupNorm`/`LayerNorm`, and the activations are
+  batch/row-parallel across all CPU cores, with a GEMM-style,
+  cache-friendly inner loop for the convolutions — a ~19x wall-clock
+  improvement over a naive single-threaded implementation on the
+  `cifar10_cnn` benchmark. Run `go test ./nn/ -bench . -benchmem` to
+  measure on your own machine.
 - **`data`**: CSV loading, z-score/min-max normalization, train/val/test
-  splitting, class balancing (oversample/undersample), MNIST-style and
-  CIFAR-10/CIFAR-100 image loaders — all with explicit `*rand.Rand`, no
-  global state.
+  splitting, class balancing (oversample/undersample), horizontal-flip
+  augmentation, MNIST-style and CIFAR-10/CIFAR-100 image loaders — all
+  with explicit `*rand.Rand`, no global state.
 - **Export** (`export`): Convert trained models to standalone Go source code
   with zero dependencies. Single-file inference functions work anywhere Go
   runs — native, WASM, TinyGo. Bit-exact parity with training engine.
@@ -152,9 +189,9 @@ See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for deta
 
 ## Layout
 
-    nn/       modules, tensors, initializers, serialization
-    train/    trainer, optimizers, losses, callbacks, schedulers, cross-validation
-    data/     CSV/image loading, normalization, splitting, balancing
+    nn/       modules (dense, conv, attention, normalization), tensors, initializers, serialization
+    train/    trainer, optimizers, losses, callbacks, schedulers, cross-validation, reporting
+    data/     CSV/image loading, normalization, splitting, balancing, augmentation
     export/   model JSON -> dependency-free Go inference source
     serve/    HTTP serving: hot-swap, metrics, online learning, rollback
     tune/     search spaces, worker-pool random search, ASHA pruning
@@ -167,6 +204,8 @@ See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for deta
     go build ./...
     go vet ./...
     go test ./...
+    go test -race ./...              # concurrency-sensitive: nn's layers parallelize internally
+    go test ./nn/ -bench . -benchmem # Conv2D/Linear/BatchNorm throughput
 
 ## Documentation
 
@@ -177,12 +216,25 @@ See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for deta
 ## Design
 
 See [`docs/superpowers/specs/2026-07-17-flax-restructure-design.md`](docs/superpowers/specs/2026-07-17-flax-restructure-design.md)
-for the architecture this library follows and the bugs it fixed.
+for the architecture this library follows and the bugs it fixed, and
+[`docs/superpowers/specs/2026-07-20-attention-design.md`](docs/superpowers/specs/2026-07-20-attention-design.md)
+for how attention fits into that architecture without changing the core
+`Module` interface.
 
 ## Non-goals
 
-Autodiff (backprop is manual per-module), backward compatibility with the
-pre-restructure API and JSON format, GPU/SIMD/goroutine-parallel
-execution, recurrent layers, data augmentation, and regression metrics
-(RMSE/R²) are all explicitly out of scope — see the design doc §2–3 for
-the full rationale.
+Autodiff (backprop is manual per-module — every layer hand-derives its
+own gradient, which is what the gradient-check tests in `nn/` exist to
+verify), backward compatibility with the pre-restructure API and JSON
+format, GPU/SIMD execution, and recurrent layers (RNN/LSTM/GRU) are all
+explicitly out of scope for now. Attention's per-batch padding masks
+(only a fixed causal/non-causal mask is supported) and cross-attention's
+lack of a `Sequential`-composable convenience wrapper (it takes two
+inputs, so it's called directly) are deliberate scope boundaries, not
+oversights — see the design docs linked above for the full rationale.
+
+## License
+
+Not yet set. If you're planning to depend on this library publicly,
+resolve this before relying on it — an unlicensed public repository
+grants no usage rights by default.

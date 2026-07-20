@@ -50,3 +50,39 @@ func TestLinearParamGradients(t *testing.T) {
 	checkParamGradient(t, forward, backward, l.Params()[0]) // W
 	checkParamGradient(t, forward, backward, l.Params()[1]) // B
 }
+
+func TestLinearForward3DSequenceInput(t *testing.T) {
+	rng := NewRNG(4)
+	l := Linear(rng, 3, 2, XavierInit())
+	x := NewTensor([]int{2, 4, 3}) // [batch=2, seqLen=4, features=3]
+	for i := range x.Data {
+		x.Data[i] = float32(i%5)*0.1 - 0.2
+	}
+	ctx := &Context{Mode: Inference}
+	y, err := l.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	want := []int{2, 4, 2}
+	for i := range want {
+		if y.Shape[i] != want[i] {
+			t.Fatalf("output shape = %v, want %v", y.Shape, want)
+		}
+	}
+}
+
+func TestLinear3DGradients(t *testing.T) {
+	rng := NewRNG(5)
+	l := Linear(rng, 3, 2, XavierInit())
+	x := NewTensor([]int{2, 3, 3})
+	for i := range x.Data {
+		x.Data[i] = float32(i%7)*0.08 - 0.25
+	}
+	ctx := &Context{Mode: Inference}
+	checkInputGradient(t, l, ctx, x)
+	forward := func() (*Tensor, error) { return l.Forward(ctx, x) }
+	backward := func(g *Tensor) (*Tensor, error) { return l.Backward(ctx, g) }
+	for _, p := range l.Params() {
+		checkParamGradient(t, forward, backward, p)
+	}
+}
