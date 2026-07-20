@@ -161,11 +161,11 @@ func TestPredictConcurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	for range 100 {
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for range 50 {
+			for j := 0; j < 50; j++ {
 				got, _, err := s.Predict([]float32{1, 0})
 				if err != nil || got[0] != want[0] {
 					t.Errorf("racy or failed prediction: %v %v", got, err)
