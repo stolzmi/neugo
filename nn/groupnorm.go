@@ -36,18 +36,6 @@ func GroupNorm(groups, channels int) *GroupNormLayer {
 	}
 }
 
-// LayerNorm normalizes each sample independently over all of its
-// non-batch dimensions (Ba, Kiros & Hinton, 2016) — exactly GroupNorm with
-// a single group. For its primary use case, dense [batch, features]
-// tensors (e.g. around a Linear layer), this is the standard, unambiguous
-// definition. For conv [batch, h, w, channels] tensors it reduces over
-// channels and spatial positions jointly per sample, which is a real but
-// less common LayerNorm variant — GroupNorm with a larger group count is
-// usually the better fit for conv features.
-func LayerNorm(channels int) *GroupNormLayer {
-	return GroupNorm(1, channels)
-}
-
 func (g *GroupNormLayer) OutputShape(inShape []int) ([]int, error) {
 	if len(inShape) == 0 || inShape[len(inShape)-1] != g.channels {
 		return nil, fmt.Errorf("nn: GroupNorm configured for %d channels, got shape %v", g.channels, inShape)
