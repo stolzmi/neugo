@@ -2,7 +2,7 @@ package train
 
 import (
 	"fmt"
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 type Trainer struct {

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"neugo/nn"
-	"neugo/train"
+	"github.com/stolzmi/neugo/nn"
+	"github.com/stolzmi/neugo/train"
 )
 
 // Sample represents a training sample with input and target.

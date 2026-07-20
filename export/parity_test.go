@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 func TestGeneratedCodeMatchesEngineExactly(t *testing.T) {

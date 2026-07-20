@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 func modelJSON(t *testing.T, m *nn.SequentialModel) []byte {

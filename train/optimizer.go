@@ -2,7 +2,7 @@ package train
 
 import (
 	"math"
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 // Optimizer reads params[i].Grad and mutates params[i].Value.

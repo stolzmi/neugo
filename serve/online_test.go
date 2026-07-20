@@ -9,8 +9,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"neugo/nn"
-	"neugo/train"
+	"github.com/stolzmi/neugo/nn"
+	"github.com/stolzmi/neugo/train"
 )
 
 func xorModel(t *testing.T) *nn.SequentialModel {

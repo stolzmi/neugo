@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"neugo/nn"
-	"neugo/train"
+	"github.com/stolzmi/neugo/nn"
+	"github.com/stolzmi/neugo/train"
 )
 
 func toTensor(rows [][]float32) *nn.Tensor {

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 func TestExportSubcommand(t *testing.T) {

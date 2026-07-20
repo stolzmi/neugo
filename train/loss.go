@@ -3,7 +3,7 @@ package train
 import (
 	"fmt"
 	"math"
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 // Loss returns scalar loss (batch-mean) and dLoss/dPred.

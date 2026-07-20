@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"neugo/export"
+	"github.com/stolzmi/neugo/export"
 )
 
 func run(args []string, stderr io.Writer) error {

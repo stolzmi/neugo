@@ -2,7 +2,7 @@ package train
 
 import (
 	"fmt"
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 // Metrics holds evaluation results, macro-averaged for multiclass.

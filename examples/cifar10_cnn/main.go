@@ -12,9 +12,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"neugo/data"
-	"neugo/nn"
-	"neugo/train"
+	"github.com/stolzmi/neugo/data"
+	"github.com/stolzmi/neugo/nn"
+	"github.com/stolzmi/neugo/train"
 )
 
 const (

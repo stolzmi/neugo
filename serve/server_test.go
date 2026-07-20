@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 func tinyModel(t *testing.T) *nn.SequentialModel {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"neugo/nn"
-	"neugo/train"
+	"github.com/stolzmi/neugo/nn"
+	"github.com/stolzmi/neugo/train"
 )
 
 // ringBuffer is a fixed-capacity circular buffer for samples.

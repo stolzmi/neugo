@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 )
 
 func TestWasmCrossCompile(t *testing.T) {

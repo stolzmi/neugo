@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"neugo/nn"
-	"neugo/serve"
-	"neugo/train"
+	"github.com/stolzmi/neugo/nn"
+	"github.com/stolzmi/neugo/serve"
+	"github.com/stolzmi/neugo/train"
 )
 
 func main() {

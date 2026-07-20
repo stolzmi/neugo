@@ -2,7 +2,7 @@ package train
 
 import (
 	"math/rand"
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 	"testing"
 )
 

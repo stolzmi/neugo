@@ -1,7 +1,7 @@
 package train
 
 import (
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 	"testing"
 )
 

@@ -3,7 +3,7 @@ package train
 import (
 	"fmt"
 	"math"
-	"neugo/nn"
+	"github.com/stolzmi/neugo/nn"
 	"time"
 )
 
