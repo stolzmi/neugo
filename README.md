@@ -10,7 +10,7 @@ hyperparameter search.
 
 ## Install
 
-    go get neugo
+    go get github.com/stolzmi/neugo
 
 Requires Go 1.22+. No third-party dependencies — only the standard library.
 
@@ -21,8 +21,8 @@ package main
 
 import (
     "fmt"
-    "neugo/nn"
-    "neugo/train"
+    "github.com/stolzmi/neugo/nn"
+    "github.com/stolzmi/neugo/train"
 )
 
 func main() {
