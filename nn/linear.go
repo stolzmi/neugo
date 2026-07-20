@@ -4,6 +4,7 @@ package nn
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 )
 
 type LinearLayer struct {
@@ -57,15 +58,18 @@ func (l *LinearLayer) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
 	l.input = x
 	batch := x.Shape[0]
 	out := NewTensor([]int{batch, l.outFeatures})
-	for b := 0; b < batch; b++ {
-		for o := 0; o < l.outFeatures; o++ {
-			sum := l.B.Value.Data[o]
-			for i := 0; i < l.inFeatures; i++ {
-				sum += x.Data[b*l.inFeatures+i] * l.W.Value.Data[i*l.outFeatures+o]
+	// Batch-parallel: out rows are per-b disjoint; W/B are read-only here.
+	parallelChunks(batch, func(_, bStart, bEnd int) {
+		for b := bStart; b < bEnd; b++ {
+			for o := 0; o < l.outFeatures; o++ {
+				sum := l.B.Value.Data[o]
+				for i := 0; i < l.inFeatures; i++ {
+					sum += x.Data[b*l.inFeatures+i] * l.W.Value.Data[i*l.outFeatures+o]
+				}
+				out.Data[b*l.outFeatures+o] = sum
 			}
-			out.Data[b*l.outFeatures+o] = sum
 		}
-	}
+	})
 	return out, nil
 }
 
@@ -80,14 +84,32 @@ func (l *LinearLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
 	gradIn := NewTensor([]int{batch, l.inFeatures})
 	l.W.ZeroGrad()
 	l.B.ZeroGrad()
-	for b := 0; b < batch; b++ {
-		for o := 0; o < l.outFeatures; o++ {
-			g := gradOut.Data[b*l.outFeatures+o]
-			l.B.Grad.Data[o] += g
-			for i := 0; i < l.inFeatures; i++ {
-				l.W.Grad.Data[i*l.outFeatures+o] += g * l.input.Data[b*l.inFeatures+i]
-				gradIn.Data[b*l.inFeatures+i] += g * l.W.Value.Data[i*l.outFeatures+o]
+	// Batch-parallel: gradIn rows are per-b disjoint; shared W/B gradients
+	// accumulate into per-chunk partials reduced in chunk order below.
+	numChunks := len(chunkRanges(batch, runtime.GOMAXPROCS(0)))
+	wPartials := make([][]float32, numChunks)
+	bPartials := make([][]float32, numChunks)
+	parallelChunks(batch, func(chunk, bStart, bEnd int) {
+		wGrad := make([]float32, len(l.W.Grad.Data))
+		bGrad := make([]float32, len(l.B.Grad.Data))
+		wPartials[chunk], bPartials[chunk] = wGrad, bGrad
+		for b := bStart; b < bEnd; b++ {
+			for o := 0; o < l.outFeatures; o++ {
+				g := gradOut.Data[b*l.outFeatures+o]
+				bGrad[o] += g
+				for i := 0; i < l.inFeatures; i++ {
+					wGrad[i*l.outFeatures+o] += g * l.input.Data[b*l.inFeatures+i]
+					gradIn.Data[b*l.inFeatures+i] += g * l.W.Value.Data[i*l.outFeatures+o]
+				}
 			}
+		}
+	})
+	for chunk := 0; chunk < numChunks; chunk++ {
+		for i, v := range wPartials[chunk] {
+			l.W.Grad.Data[i] += v
+		}
+		for i, v := range bPartials[chunk] {
+			l.B.Grad.Data[i] += v
 		}
 	}
 	return gradIn, nil

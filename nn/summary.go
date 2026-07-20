@@ -25,6 +25,18 @@ func moduleTypeName(m Module) string {
 		return "Softmax"
 	case *SequentialModel:
 		return "Sequential"
+	case *ResidualBlock:
+		return "Residual"
+	case *GroupNormLayer:
+		return "GroupNorm"
+	case *EmbeddingLayer:
+		return "Embedding"
+	case *Conv1DLayer:
+		return "Conv1D"
+	case *ConvTranspose2DLayer:
+		return "ConvTranspose2D"
+	case *FrozenModule:
+		return "Frozen"
 	case *ActivationModule:
 		name := m.(*ActivationModule).Name()
 		// Capitalize activation names for display

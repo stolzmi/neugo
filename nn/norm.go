@@ -57,26 +57,47 @@ func (bn *BatchNormLayer) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
 	out := NewTensor(x.Shape)
 
 	if ctx.Mode != Train {
-		for i, v := range x.Data {
-			c := i % bn.channels
-			xhat := (v - bn.runningMean[c]) / float32(math.Sqrt(float64(bn.runningVar[c]+bn.eps)))
-			out.Data[i] = bn.Gamma.Value.Data[c]*xhat + bn.Beta.Value.Data[c]
+		// Precompute per-channel scale/shift so the elementwise pass is a
+		// single FMA; channels are the fastest axis, so a wrapping counter
+		// replaces the per-element modulo.
+		scale := make([]float32, bn.channels)
+		shift := make([]float32, bn.channels)
+		for c := range scale {
+			s := bn.Gamma.Value.Data[c] / float32(math.Sqrt(float64(bn.runningVar[c]+bn.eps)))
+			scale[c] = s
+			shift[c] = bn.Beta.Value.Data[c] - s*bn.runningMean[c]
 		}
+		parallelChunks(len(x.Data), func(_, start, end int) {
+			c := start % bn.channels
+			for i := start; i < end; i++ {
+				out.Data[i] = scale[c]*x.Data[i] + shift[c]
+				c++
+				if c == bn.channels {
+					c = 0
+				}
+			}
+		})
 		return out, nil
 	}
 
 	n := len(x.Data) / bn.channels
 	mean := make([]float32, bn.channels)
-	for i, v := range x.Data {
-		mean[i%bn.channels] += v
+	for base := 0; base < len(x.Data); base += bn.channels {
+		row := x.Data[base : base+bn.channels]
+		for c, v := range row {
+			mean[c] += v
+		}
 	}
 	for c := range mean {
 		mean[c] /= float32(n)
 	}
 	variance := make([]float32, bn.channels)
-	for i, v := range x.Data {
-		d := v - mean[i%bn.channels]
-		variance[i%bn.channels] += d * d
+	for base := 0; base < len(x.Data); base += bn.channels {
+		row := x.Data[base : base+bn.channels]
+		for c, v := range row {
+			d := v - mean[c]
+			variance[c] += d * d
+		}
 	}
 	for c := range variance {
 		variance[c] /= float32(n)
@@ -86,12 +107,22 @@ func (bn *BatchNormLayer) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
 	bn.batchMean = mean
 	bn.batchVar = variance
 	bn.normalized = make([]float32, len(x.Data))
-	for i, v := range x.Data {
-		c := i % bn.channels
-		xhat := (v - mean[c]) / float32(math.Sqrt(float64(variance[c]+bn.eps)))
-		bn.normalized[i] = xhat
-		out.Data[i] = bn.Gamma.Value.Data[c]*xhat + bn.Beta.Value.Data[c]
+	invStd := make([]float32, bn.channels)
+	for c := range invStd {
+		invStd[c] = 1.0 / float32(math.Sqrt(float64(variance[c]+bn.eps)))
 	}
+	parallelChunks(len(x.Data), func(_, start, end int) {
+		c := start % bn.channels
+		for i := start; i < end; i++ {
+			xhat := (x.Data[i] - mean[c]) * invStd[c]
+			bn.normalized[i] = xhat
+			out.Data[i] = bn.Gamma.Value.Data[c]*xhat + bn.Beta.Value.Data[c]
+			c++
+			if c == bn.channels {
+				c = 0
+			}
+		}
+	})
 	for c := 0; c < bn.channels; c++ {
 		bn.runningMean[c] = bn.momentum*bn.runningMean[c] + (1-bn.momentum)*mean[c]
 		bn.runningVar[c] = bn.momentum*bn.runningVar[c] + (1-bn.momentum)*variance[c]
@@ -110,11 +141,13 @@ func (bn *BatchNormLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, erro
 	bn.Beta.ZeroGrad()
 
 	dxhat := make([]float32, len(bn.input.Data))
-	for i, dy := range gradOut.Data {
-		c := i % bn.channels
-		bn.Gamma.Grad.Data[c] += dy * bn.normalized[i]
-		bn.Beta.Grad.Data[c] += dy
-		dxhat[i] = dy * bn.Gamma.Value.Data[c]
+	for base := 0; base < len(gradOut.Data); base += bn.channels {
+		gRow := gradOut.Data[base : base+bn.channels]
+		for c, dy := range gRow {
+			bn.Gamma.Grad.Data[c] += dy * bn.normalized[base+c]
+			bn.Beta.Grad.Data[c] += dy
+			dxhat[base+c] = dy * bn.Gamma.Value.Data[c]
+		}
 	}
 
 	invStd := make([]float32, bn.channels)
@@ -123,23 +156,27 @@ func (bn *BatchNormLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, erro
 	}
 
 	dvar := make([]float32, bn.channels)
-	for i, dxh := range dxhat {
-		c := i % bn.channels
-		centered := bn.input.Data[i] - bn.batchMean[c]
-		dvar[c] += dxh * centered * -0.5 * invStd[c] * invStd[c] * invStd[c]
-	}
-
 	dmean := make([]float32, bn.channels)
-	for i, dxh := range dxhat {
-		c := i % bn.channels
-		dmean[c] += dxh * -invStd[c]
+	for base := 0; base < len(dxhat); base += bn.channels {
+		row := dxhat[base : base+bn.channels]
+		for c, dxh := range row {
+			centered := bn.input.Data[base+c] - bn.batchMean[c]
+			dvar[c] += dxh * centered * -0.5 * invStd[c] * invStd[c] * invStd[c]
+			dmean[c] += dxh * -invStd[c]
+		}
 	}
 
-	for i := range bn.input.Data {
-		c := i % bn.channels
-		centered := bn.input.Data[i] - bn.batchMean[c]
-		gradIn.Data[i] = dxhat[i]*invStd[c] + dvar[c]*2*centered/nf + dmean[c]/nf
-	}
+	parallelChunks(len(bn.input.Data), func(_, start, end int) {
+		c := start % bn.channels
+		for i := start; i < end; i++ {
+			centered := bn.input.Data[i] - bn.batchMean[c]
+			gradIn.Data[i] = dxhat[i]*invStd[c] + dvar[c]*2*centered/nf + dmean[c]/nf
+			c++
+			if c == bn.channels {
+				c = 0
+			}
+		}
+	})
 	return gradIn, nil
 }
 

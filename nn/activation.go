@@ -94,17 +94,22 @@ func GELU() *ActivationModule {
 func (a *ActivationModule) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
 	a.input = x
 	out := NewTensor(x.Shape)
-	for i, v := range x.Data {
-		out.Data[i] = a.fn.apply(v)
-	}
+	// Elementwise, so parallel chunks over the flat data are trivially safe.
+	parallelChunks(len(x.Data), func(_, start, end int) {
+		for i := start; i < end; i++ {
+			out.Data[i] = a.fn.apply(x.Data[i])
+		}
+	})
 	return out, nil
 }
 
 func (a *ActivationModule) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
 	gradIn := NewTensor(a.input.Shape)
-	for i, v := range a.input.Data {
-		gradIn.Data[i] = gradOut.Data[i] * a.fn.deriv(v)
-	}
+	parallelChunks(len(a.input.Data), func(_, start, end int) {
+		for i := start; i < end; i++ {
+			gradIn.Data[i] = gradOut.Data[i] * a.fn.deriv(a.input.Data[i])
+		}
+	})
 	return gradIn, nil
 }
 

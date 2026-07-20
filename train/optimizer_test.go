@@ -61,6 +61,38 @@ func TestAdamDecreasesQuadraticLoss(t *testing.T) {
 	}
 }
 
+func TestAdamZeroWeightDecayMatchesPlainAdam(t *testing.T) {
+	p := newTestParam([]float32{10}, []float32{0})
+	plain := Adam(0.5, 0.9, 0.999, 1e-8)
+	decoupled := AdamW(0.5, 0.9, 0.999, 1e-8, 0)
+	for i := 0; i < 10; i++ {
+		g := 2 * p.Value.Data[0]
+		p.Grad.Data[0] = g
+		plain.Step([]*nn.Param{p})
+	}
+	p2 := newTestParam([]float32{10}, []float32{0})
+	for i := 0; i < 10; i++ {
+		p2.Grad.Data[0] = 2 * p2.Value.Data[0]
+		decoupled.Step([]*nn.Param{p2})
+	}
+	if diff := math.Abs(float64(p.Value.Data[0] - p2.Value.Data[0])); diff > 1e-6 {
+		t.Fatalf("AdamW with WeightDecay=0 diverged from Adam: %v vs %v", p2.Value.Data[0], p.Value.Data[0])
+	}
+}
+
+func TestAdamWShrinksWeightBeyondGradientUpdate(t *testing.T) {
+	// Zero gradient isolates the decay term: only p -= LR*WeightDecay*p
+	// should move the value, since Adam's own update needs a nonzero
+	// gradient to move at all.
+	p := newTestParam([]float32{10}, []float32{0})
+	opt := AdamW(0.1, 0.9, 0.999, 1e-8, 0.1)
+	opt.Step([]*nn.Param{p})
+	want := float32(10 - 0.1*0.1*10) // 9.9
+	if diff := math.Abs(float64(p.Value.Data[0] - want)); diff > 1e-5 {
+		t.Fatalf("Value after 1 AdamW step with zero grad = %v, want %v", p.Value.Data[0], want)
+	}
+}
+
 func TestRMSpropDecreasesQuadraticLoss(t *testing.T) {
 	p := newTestParam([]float32{10}, []float32{0})
 	opt := RMSprop(0.1, 0.9, 1e-8)

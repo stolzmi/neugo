@@ -18,3 +18,10 @@ dataset/cifar100/
 # Exceed GitHub 100MB limit — kept local only (from flax-restructure snapshot)
 dataset/test_set/x_test.csv
 dataset/train_set/x_train.csv
+.superpowers/
+
+# Local Claude Code agent state / worktrees — not source.
+.claude/
+
+# examples/cifar10_cnn showcase checkpoint — see model-artifacts comment above.
+cifar_10

@@ -57,8 +57,13 @@ func (o *MomentumOptimizer) GetLR() float32   { return o.LR }
 
 type AdamOptimizer struct {
 	LR, Beta1, Beta2, Eps float32
-	t                     int
-	m, v                  map[*nn.Param][]float32
+	// WeightDecay applies decoupled weight decay (Loshchilov & Hutter,
+	// AdamW): p -= LR*WeightDecay*p, applied directly to the parameter
+	// value each step, separately from the gradient-based moment update.
+	// Zero (the Adam default) disables it entirely.
+	WeightDecay float32
+	t           int
+	m, v        map[*nn.Param][]float32
 }
 
 func Adam(lr, beta1, beta2, eps float32) *AdamOptimizer {
@@ -66,6 +71,13 @@ func Adam(lr, beta1, beta2, eps float32) *AdamOptimizer {
 		LR: lr, Beta1: beta1, Beta2: beta2, Eps: eps,
 		m: map[*nn.Param][]float32{}, v: map[*nn.Param][]float32{},
 	}
+}
+
+// AdamW is Adam with decoupled weight decay set from construction.
+func AdamW(lr, beta1, beta2, eps, weightDecay float32) *AdamOptimizer {
+	o := Adam(lr, beta1, beta2, eps)
+	o.WeightDecay = weightDecay
+	return o
 }
 
 func (o *AdamOptimizer) Step(params []*nn.Param) {
@@ -89,6 +101,9 @@ func (o *AdamOptimizer) Step(params []*nn.Param) {
 			v[i] = o.Beta2*v[i] + (1-o.Beta2)*g*g
 			mHat := m[i] / (1 - b1t)
 			vHat := v[i] / (1 - b2t)
+			if o.WeightDecay != 0 {
+				p.Value.Data[i] -= o.LR * o.WeightDecay * p.Value.Data[i]
+			}
 			p.Value.Data[i] -= o.LR * mHat / (float32(math.Sqrt(float64(vHat))) + o.Eps)
 		}
 	}

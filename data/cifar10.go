@@ -155,9 +155,31 @@ func LoadCIFAR10BinaryClassSubset(filepath string, targetClasses []int) (*CIFAR1
 	}, nil
 }
 
+// ImageStats holds the per-channel mean/std NormalizeImagesWithStats
+// computed, so callers can persist them alongside a trained model (see
+// nn.SaveWithMetadata) and reproduce identical normalization at inference
+// time without recomputing statistics over a training set that may no
+// longer be at hand.
+type ImageStats struct {
+	Mean []float32
+	Std  []float32
+}
+
+// NormalizeImages is a convenience wrapper around
+// NormalizeImagesWithStats for callers that don't need the computed
+// statistics.
 func NormalizeImages(images []*Image) []*Image {
+	normalized, _ := NormalizeImagesWithStats(images)
+	return normalized
+}
+
+// NormalizeImagesWithStats z-score normalizes images per channel and
+// returns the per-channel mean/std it used, so the same transform can be
+// reapplied later (e.g. at inference, via ImageStats saved with the
+// model).
+func NormalizeImagesWithStats(images []*Image) ([]*Image, ImageStats) {
 	if len(images) == 0 {
-		return images
+		return images, ImageStats{}
 	}
 	numChannels, height, width := images[0].Channels, images[0].Height, images[0].Width
 	means := make([]float32, numChannels)
@@ -203,5 +225,5 @@ func NormalizeImages(images []*Image) []*Image {
 			}
 		}
 	}
-	return normalized
+	return normalized, ImageStats{Mean: means, Std: stds}
 }

@@ -19,6 +19,9 @@ type moduleDoc struct {
 	Config  json.RawMessage     `json:"config,omitempty"`
 	Params  map[string]paramDoc `json:"params,omitempty"`
 	Modules []moduleDoc         `json:"modules,omitempty"`
+	// Shortcut is only set for "residual" nodes: nil means an identity
+	// shortcut, present means a projection module (see ResidualBlock).
+	Shortcut *moduleDoc `json:"shortcut,omitempty"`
 }
 
 type linearConfig struct {
@@ -31,6 +34,7 @@ type conv2DConfig struct {
 	OutChannels int `json:"out_channels"`
 	KernelSize  int `json:"kernel_size"`
 	Padding     int `json:"padding"`
+	Stride      int `json:"stride"`
 }
 
 type poolConfig struct {
@@ -46,6 +50,32 @@ type batchNormConfig struct {
 	Channels    int       `json:"channels"`
 	RunningMean []float32 `json:"running_mean"`
 	RunningVar  []float32 `json:"running_var"`
+}
+
+type groupNormConfig struct {
+	Groups   int `json:"groups"`
+	Channels int `json:"channels"`
+}
+
+type embeddingConfig struct {
+	VocabSize int `json:"vocab_size"`
+	EmbedDim  int `json:"embed_dim"`
+}
+
+type conv1DConfig struct {
+	InChannels  int `json:"in_channels"`
+	OutChannels int `json:"out_channels"`
+	KernelSize  int `json:"kernel_size"`
+	Padding     int `json:"padding"`
+	Stride      int `json:"stride"`
+}
+
+type convTranspose2DConfig struct {
+	InChannels  int `json:"in_channels"`
+	OutChannels int `json:"out_channels"`
+	KernelSize  int `json:"kernel_size"`
+	Padding     int `json:"padding"`
+	Stride      int `json:"stride"`
 }
 
 type leakyReLUConfig struct {
@@ -68,7 +98,7 @@ func encodeModule(m Module) (moduleDoc, error) {
 	case *Conv2DLayer:
 		return moduleDoc{
 			Type:   "conv2d",
-			Config: mustMarshal(conv2DConfig{InChannels: v.inChannels, OutChannels: v.outChannels, KernelSize: v.kernelSize, Padding: v.padding}),
+			Config: mustMarshal(conv2DConfig{InChannels: v.inChannels, OutChannels: v.outChannels, KernelSize: v.kernelSize, Padding: v.padding, Stride: v.stride}),
 			Params: map[string]paramDoc{"W": toParamDoc(v.W), "B": toParamDoc(v.B)},
 		}, nil
 	case *MaxPool2DLayer:
@@ -85,6 +115,36 @@ func encodeModule(m Module) (moduleDoc, error) {
 			Config: mustMarshal(batchNormConfig{Channels: v.channels, RunningMean: v.runningMean, RunningVar: v.runningVar}),
 			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma), "beta": toParamDoc(v.Beta)},
 		}, nil
+	case *GroupNormLayer:
+		return moduleDoc{
+			Type:   "groupnorm",
+			Config: mustMarshal(groupNormConfig{Groups: v.groups, Channels: v.channels}),
+			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma), "beta": toParamDoc(v.Beta)},
+		}, nil
+	case *EmbeddingLayer:
+		return moduleDoc{
+			Type:   "embedding",
+			Config: mustMarshal(embeddingConfig{VocabSize: v.vocabSize, EmbedDim: v.embedDim}),
+			Params: map[string]paramDoc{"W": toParamDoc(v.W)},
+		}, nil
+	case *Conv1DLayer:
+		return moduleDoc{
+			Type:   "conv1d",
+			Config: mustMarshal(conv1DConfig{InChannels: v.inChannels, OutChannels: v.outChannels, KernelSize: v.kernelSize, Padding: v.padding, Stride: v.stride}),
+			Params: map[string]paramDoc{"W": toParamDoc(v.W), "B": toParamDoc(v.B)},
+		}, nil
+	case *ConvTranspose2DLayer:
+		return moduleDoc{
+			Type:   "convtranspose2d",
+			Config: mustMarshal(convTranspose2DConfig{InChannels: v.inChannels, OutChannels: v.outChannels, KernelSize: v.kernelSize, Padding: v.padding, Stride: v.stride}),
+			Params: map[string]paramDoc{"W": toParamDoc(v.W), "B": toParamDoc(v.B)},
+		}, nil
+	case *FrozenModule:
+		innerDoc, err := encodeModule(v.inner)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		return moduleDoc{Type: "frozen", Modules: []moduleDoc{innerDoc}}, nil
 	case *SoftmaxModule:
 		return moduleDoc{Type: "softmax"}, nil
 	case *ActivationModule:
@@ -102,6 +162,24 @@ func encodeModule(m Module) (moduleDoc, error) {
 			children[i] = cd
 		}
 		return moduleDoc{Type: "sequential", Modules: children}, nil
+	case *ResidualBlock:
+		children := make([]moduleDoc, len(v.inner))
+		for i, cm := range v.inner {
+			cd, err := encodeModule(cm)
+			if err != nil {
+				return moduleDoc{}, err
+			}
+			children[i] = cd
+		}
+		doc := moduleDoc{Type: "residual", Modules: children}
+		if v.shortcut != nil {
+			sd, err := encodeModule(v.shortcut)
+			if err != nil {
+				return moduleDoc{}, err
+			}
+			doc.Shortcut = &sd
+		}
+		return doc, nil
 	default:
 		return moduleDoc{}, fmt.Errorf("nn: Save: unsupported module type %T", m)
 	}
@@ -190,7 +268,12 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		if cfg.InChannels <= 0 || cfg.OutChannels <= 0 || cfg.KernelSize <= 0 {
 			return nil, fmt.Errorf("nn: Load: conv2d config: in_channels, out_channels, and kernel_size must be positive, got %d, %d, and %d", cfg.InChannels, cfg.OutChannels, cfg.KernelSize)
 		}
-		c := newConv2D(rng, cfg.InChannels, cfg.OutChannels, cfg.KernelSize, cfg.Padding, ZerosInit())
+		// Models saved before Stride existed have it zero-valued in JSON;
+		// they were always stride-1, so default it here rather than fail.
+		if cfg.Stride == 0 {
+			cfg.Stride = 1
+		}
+		c := newConv2D(rng, cfg.InChannels, cfg.OutChannels, cfg.KernelSize, cfg.Padding, cfg.Stride, ZerosInit())
 		w, err := paramOrErr(doc, "W", "conv2d")
 		if err != nil {
 			return nil, err
@@ -265,6 +348,119 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		copy(bn.Beta.Value.Data, beta.Data)
 		return bn, nil
 
+	case "groupnorm":
+		var cfg groupNormConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: groupnorm config: %w", err)
+		}
+		if cfg.Groups <= 0 || cfg.Channels <= 0 || cfg.Channels%cfg.Groups != 0 {
+			return nil, fmt.Errorf("nn: Load: groupnorm config: channels %d must be positive and evenly divisible by groups %d", cfg.Channels, cfg.Groups)
+		}
+		gn := GroupNorm(cfg.Groups, cfg.Channels)
+		gamma, err := paramOrErr(doc, "gamma", "groupnorm")
+		if err != nil {
+			return nil, err
+		}
+		beta, err := paramOrErr(doc, "beta", "groupnorm")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("groupnorm", "gamma", len(gn.Gamma.Value.Data), gamma); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("groupnorm", "beta", len(gn.Beta.Value.Data), beta); err != nil {
+			return nil, err
+		}
+		copy(gn.Gamma.Value.Data, gamma.Data)
+		copy(gn.Beta.Value.Data, beta.Data)
+		return gn, nil
+
+	case "embedding":
+		var cfg embeddingConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: embedding config: %w", err)
+		}
+		if cfg.VocabSize <= 0 || cfg.EmbedDim <= 0 {
+			return nil, fmt.Errorf("nn: Load: embedding config: vocab_size and embed_dim must be positive, got %d and %d", cfg.VocabSize, cfg.EmbedDim)
+		}
+		e := Embedding(rng, cfg.VocabSize, cfg.EmbedDim, ZerosInit())
+		w, err := paramOrErr(doc, "W", "embedding")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("embedding", "W", len(e.W.Value.Data), w); err != nil {
+			return nil, err
+		}
+		copy(e.W.Value.Data, w.Data)
+		return e, nil
+
+	case "conv1d":
+		var cfg conv1DConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: conv1d config: %w", err)
+		}
+		if cfg.InChannels <= 0 || cfg.OutChannels <= 0 || cfg.KernelSize <= 0 {
+			return nil, fmt.Errorf("nn: Load: conv1d config: in_channels, out_channels, and kernel_size must be positive, got %d, %d, and %d", cfg.InChannels, cfg.OutChannels, cfg.KernelSize)
+		}
+		if cfg.Stride == 0 {
+			cfg.Stride = 1
+		}
+		c := newConv1D(rng, cfg.InChannels, cfg.OutChannels, cfg.KernelSize, cfg.Padding, cfg.Stride, ZerosInit())
+		w, err := paramOrErr(doc, "W", "conv1d")
+		if err != nil {
+			return nil, err
+		}
+		b, err := paramOrErr(doc, "B", "conv1d")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("conv1d", "W", len(c.W.Value.Data), w); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("conv1d", "B", len(c.B.Value.Data), b); err != nil {
+			return nil, err
+		}
+		copy(c.W.Value.Data, w.Data)
+		copy(c.B.Value.Data, b.Data)
+		return c, nil
+
+	case "convtranspose2d":
+		var cfg convTranspose2DConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: convtranspose2d config: %w", err)
+		}
+		if cfg.InChannels <= 0 || cfg.OutChannels <= 0 || cfg.KernelSize <= 0 || cfg.Stride <= 0 {
+			return nil, fmt.Errorf("nn: Load: convtranspose2d config: in_channels, out_channels, kernel_size, and stride must be positive, got %d, %d, %d, and %d", cfg.InChannels, cfg.OutChannels, cfg.KernelSize, cfg.Stride)
+		}
+		c := ConvTranspose2D(rng, cfg.InChannels, cfg.OutChannels, cfg.KernelSize, cfg.Stride, cfg.Padding, ZerosInit())
+		w, err := paramOrErr(doc, "W", "convtranspose2d")
+		if err != nil {
+			return nil, err
+		}
+		b, err := paramOrErr(doc, "B", "convtranspose2d")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("convtranspose2d", "W", len(c.W.Value.Data), w); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("convtranspose2d", "B", len(c.B.Value.Data), b); err != nil {
+			return nil, err
+		}
+		copy(c.W.Value.Data, w.Data)
+		copy(c.B.Value.Data, b.Data)
+		return c, nil
+
+	case "frozen":
+		if len(doc.Modules) != 1 {
+			return nil, fmt.Errorf("nn: Load: frozen module must wrap exactly 1 module, got %d", len(doc.Modules))
+		}
+		inner, err := decodeModule(doc.Modules[0], rng)
+		if err != nil {
+			return nil, err
+		}
+		return &FrozenModule{inner: inner}, nil
+
 	case "softmax":
 		return Softmax(), nil
 	case "relu":
@@ -292,6 +488,25 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 			children[i] = cm
 		}
 		return &SequentialModel{modules: children}, nil
+
+	case "residual":
+		children := make([]Module, len(doc.Modules))
+		for i, cd := range doc.Modules {
+			cm, err := decodeModule(cd, rng)
+			if err != nil {
+				return nil, err
+			}
+			children[i] = cm
+		}
+		var shortcut Module
+		if doc.Shortcut != nil {
+			sm, err := decodeModule(*doc.Shortcut, rng)
+			if err != nil {
+				return nil, err
+			}
+			shortcut = sm
+		}
+		return &ResidualBlock{inner: children, shortcut: shortcut}, nil
 
 	default:
 		return nil, fmt.Errorf("nn: Load: unknown module type %q", doc.Type)
@@ -342,6 +557,71 @@ func Marshal(model *SequentialModel) ([]byte, error) {
 // The root module must be of type "sequential".
 func Unmarshal(data []byte) (*SequentialModel, error) {
 	return decodeRoot(data, "Unmarshal")
+}
+
+// NormalizationStats is a per-channel mean/std pair, typically produced
+// by data.NormalizeImagesWithStats, bundled into Metadata so a saved
+// model carries the exact preprocessing it was trained with.
+type NormalizationStats struct {
+	Mean []float32 `json:"mean"`
+	Std  []float32 `json:"std"`
+}
+
+// Metadata is everything about a trained model that isn't a weight or an
+// architecture choice, but that inference still needs: what shape to feed
+// it, what its output classes mean, and how to preprocess raw input the
+// same way training data was preprocessed. All fields are optional.
+type Metadata struct {
+	InputShape    []int               `json:"input_shape,omitempty"`
+	ClassNames    []string            `json:"class_names,omitempty"`
+	Normalization *NormalizationStats `json:"normalization,omitempty"`
+}
+
+type modelDoc struct {
+	Model    moduleDoc `json:"model"`
+	Metadata Metadata  `json:"metadata"`
+}
+
+// SaveWithMetadata is Save plus an arbitrary Metadata envelope — a
+// distinct, opt-in file format from plain Save/Load (the two are not
+// cross-compatible: a file written by Save must be read by Load, and one
+// written by SaveWithMetadata must be read by LoadWithMetadata). Use it
+// when you want a single file that's sufficient to run inference on raw
+// input without separately tracking normalization stats or class names.
+func SaveWithMetadata(model *SequentialModel, path string, meta Metadata) error {
+	doc, err := encodeRoot(model, "SaveWithMetadata")
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(modelDoc{Model: doc, Metadata: meta}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("nn: SaveWithMetadata: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("nn: SaveWithMetadata: %w", err)
+	}
+	return nil
+}
+
+// LoadWithMetadata reads a file written by SaveWithMetadata.
+func LoadWithMetadata(path string) (*SequentialModel, Metadata, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, Metadata{}, fmt.Errorf("nn: LoadWithMetadata: %w", err)
+	}
+	var full modelDoc
+	if err := json.Unmarshal(data, &full); err != nil {
+		return nil, Metadata{}, fmt.Errorf("nn: LoadWithMetadata: %w", err)
+	}
+	m, err := decodeModule(full.Model, NewRNG(0))
+	if err != nil {
+		return nil, Metadata{}, err
+	}
+	seq, ok := m.(*SequentialModel)
+	if !ok {
+		return nil, Metadata{}, fmt.Errorf("nn: LoadWithMetadata: root module has type %q, want \"sequential\"", full.Model.Type)
+	}
+	return seq, full.Metadata, nil
 }
 
 // Clone creates a fully independent deep copy of a model by marshaling

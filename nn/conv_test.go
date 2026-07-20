@@ -64,10 +64,44 @@ func TestConv2DParamGradients(t *testing.T) {
 
 func TestConv2DNegativePaddingReturnsErrorNotPanic(t *testing.T) {
 	rng := NewRNG(5)
-	c := newConv2D(rng, 1, 4, 3, -1, HeInit())
+	c := newConv2D(rng, 1, 4, 3, -1, 1, HeInit())
 	_, err := c.OutputShape([]int{2, 8, 8, 1})
 	if err == nil {
 		t.Fatal("OutputShape with negative padding returned nil error, want a clean error instead of proceeding")
+	}
+}
+
+func TestConv2DStridedOutputShape(t *testing.T) {
+	rng := NewRNG(6)
+	c := Conv2DStrided(rng, 1, 4, 3, 2, 1, HeInit())
+	out, err := c.OutputShape([]int{2, 8, 8, 1})
+	if err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	want := []int{2, 4, 4, 4} // (8+2*1-3)/2+1 = 4
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("OutputShape = %v, want %v", out, want)
+		}
+	}
+}
+
+func TestConv2DStridedGradients(t *testing.T) {
+	rng := NewRNG(7)
+	c := Conv2DStrided(rng, 2, 3, 3, 2, 1, HeInit())
+	if _, err := c.OutputShape([]int{1, 7, 7, 2}); err != nil {
+		t.Fatalf("OutputShape: %v", err)
+	}
+	x := NewTensor([]int{1, 7, 7, 2})
+	for i := range x.Data {
+		x.Data[i] = float32(i%6)*0.12 - 0.3
+	}
+	ctx := &Context{Mode: Inference}
+	checkInputGradient(t, c, ctx, x)
+	forward := func() (*Tensor, error) { return c.Forward(ctx, x) }
+	backward := func(g *Tensor) (*Tensor, error) { return c.Backward(ctx, g) }
+	for _, p := range c.Params() {
+		checkParamGradient(t, forward, backward, p)
 	}
 }
 
