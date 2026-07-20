@@ -12,7 +12,7 @@ hyperparameter search.
 
     go get neugo
 
-Requires Go 1.25+. No third-party dependencies — only the standard library.
+Requires Go 1.22+. No third-party dependencies — only the standard library.
 
 ## Quickstart
 
@@ -213,28 +213,24 @@ See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for deta
 - [`docs/EXPORT_GUIDE.md`](docs/EXPORT_GUIDE.md) — exporting models to Go source.
 - [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) — hyperparameter tuning and ASHA.
 
-## Design
-
-See [`docs/superpowers/specs/2026-07-17-flax-restructure-design.md`](docs/superpowers/specs/2026-07-17-flax-restructure-design.md)
-for the architecture this library follows and the bugs it fixed, and
-[`docs/superpowers/specs/2026-07-20-attention-design.md`](docs/superpowers/specs/2026-07-20-attention-design.md)
-for how attention fits into that architecture without changing the core
-`Module` interface.
-
-## Non-goals
-
-Autodiff (backprop is manual per-module — every layer hand-derives its
-own gradient, which is what the gradient-check tests in `nn/` exist to
-verify), backward compatibility with the pre-restructure API and JSON
-format, GPU/SIMD execution, and recurrent layers (RNN/LSTM/GRU) are all
-explicitly out of scope for now. Attention's per-batch padding masks
-(only a fixed causal/non-causal mask is supported) and cross-attention's
-lack of a `Sequential`-composable convenience wrapper (it takes two
-inputs, so it's called directly) are deliberate scope boundaries, not
-oversights — see the design docs linked above for the full rationale.
-
 ## License
 
-Not yet set. If you're planning to depend on this library publicly,
-resolve this before relying on it — an unlicensed public repository
-grants no usage rights by default.
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
