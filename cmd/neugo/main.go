@@ -9,7 +9,7 @@ import (
 	"github.com/stolzmi/neugo/export"
 )
 
-func run(args []string, stderr io.Writer) error {
+func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("no subcommand provided")
 	}
@@ -19,6 +19,10 @@ func run(args []string, stderr io.Writer) error {
 	switch subcommand {
 	case "export":
 		return runExport(args[1:], stderr)
+	case "diff":
+		return runDiff(args[1:], stdout, stderr)
+	case "new":
+		return runNew(args[1:], stderr)
 	default:
 		return fmt.Errorf("unknown subcommand: %s", subcommand)
 	}
@@ -79,7 +83,7 @@ func runExport(args []string, stderr io.Writer) error {
 }
 
 func main() {
-	err := run(os.Args[1:], os.Stderr)
+	err := run(os.Args[1:], os.Stdout, os.Stderr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

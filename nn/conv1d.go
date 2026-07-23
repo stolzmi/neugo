@@ -4,7 +4,6 @@ package nn
 import (
 	"fmt"
 	"math/rand"
-	"runtime"
 )
 
 // Conv1DLayer is Conv2D's 1D sibling — input/output are [batch, length,
@@ -132,7 +131,7 @@ func (c *Conv1DLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
 	wT := c.transposedWeights()
 	xData := c.input.Data
 
-	numChunks := len(chunkRanges(batch, runtime.GOMAXPROCS(0)))
+	numChunks := numParallelChunks(batch)
 	wPartials := make([][]float32, numChunks)
 	bPartials := make([][]float32, numChunks)
 	parallelChunks(batch, func(chunk, bStart, bEnd int) {

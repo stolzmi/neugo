@@ -4,7 +4,6 @@ package nn
 import (
 	"fmt"
 	"math/rand"
-	"runtime"
 )
 
 // ConvTranspose2DLayer is a transposed ("deconvolution"/upsampling) 2D
@@ -136,7 +135,7 @@ func (c *ConvTranspose2DLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor,
 	xData := c.input.Data
 	wData := c.W.Value.Data
 
-	numChunks := len(chunkRanges(batch, runtime.GOMAXPROCS(0)))
+	numChunks := numParallelChunks(batch)
 	wPartials := make([][]float32, numChunks)
 	bPartials := make([][]float32, numChunks)
 	parallelChunks(batch, func(chunk, bStart, bEnd int) {

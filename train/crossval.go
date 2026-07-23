@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"runtime"
+	"sync"
+
+	"github.com/stolzmi/neugo/nn"
 )
 
 type Fold struct {
@@ -79,15 +83,60 @@ type CrossValResult struct {
 
 // CrossValidate calls trainFold once per fold — trainFold is expected to
 // build a fresh model, train it on fold.TrainX/TrainY, and return the
-// Metrics from evaluating it on fold.TestX/TestY.
+// Metrics from evaluating it on fold.TestX/TestY. Folds run concurrently
+// across a worker pool bounded by GOMAXPROCS (mirroring tune.Run's
+// pattern), so trainFold must be safe to call from multiple goroutines at
+// once — in practice this just means it must build its own fresh model
+// and optimizer per call rather than closing over shared mutable state.
+// Each fold writes to its own disjoint result slot, so no locking is
+// needed beyond the wait for all folds to finish. With
+// nn.SetDeterministic(true) in effect, folds run sequentially instead (in
+// fold order) for bit-exact reproducibility, matching that switch's
+// meaning elsewhere in the library.
 func CrossValidate(folds []Fold, trainFold func(fold Fold) (Metrics, error)) (CrossValResult, error) {
 	foldMetrics := make([]Metrics, len(folds))
-	for i, f := range folds {
-		m, err := trainFold(f)
+	errs := make([]error, len(folds))
+
+	if nn.IsDeterministic() {
+		for i, f := range folds {
+			m, err := trainFold(f)
+			errs[i] = err
+			foldMetrics[i] = m
+		}
+	} else {
+		workers := runtime.GOMAXPROCS(0)
+		if workers > len(folds) {
+			workers = len(folds)
+		}
+		if workers < 1 {
+			workers = 1
+		}
+
+		foldChan := make(chan int, len(folds))
+		for i := range folds {
+			foldChan <- i
+		}
+		close(foldChan)
+
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range foldChan {
+					m, err := trainFold(folds[i])
+					errs[i] = err
+					foldMetrics[i] = m
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	for i, err := range errs {
 		if err != nil {
 			return CrossValResult{}, fmt.Errorf("train: fold %d: %w", i, err)
 		}
-		foldMetrics[i] = m
 	}
 	return summarizeFolds(foldMetrics), nil
 }

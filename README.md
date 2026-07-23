@@ -51,7 +51,7 @@ func main() {
 
 ## Examples
 
-Nine runnable examples live in `examples/` — run any of them with
+Twelve runnable examples live in `examples/` — run any of them with
 `go run ./examples/<name>`:
 
 - `xor` — the Quickstart above, end to end.
@@ -73,23 +73,40 @@ Nine runnable examples live in `examples/` — run any of them with
 - `crossval` — k-fold cross-validation.
 - `serve_xor` — HTTP serving with hot-swap, metrics, and online learning.
 - `tune_wine` — hyperparameter search with ASHA pruning.
+- `sequence_rnn` — an Embedding/LSTM/LastTimestep model trained on a toy
+  sequence-classification task, exercising full backpropagation-through-time.
+- `tokenizer_stream` — the `text` package's byte-level BPE tokenizer paired
+  with the streaming training path (`data.DataLoader` + `Trainer.FitStream`)
+  and an Embedding/GRU/LastTimestep model.
+- `wasm_demo` — trains a model, exports it to dependency-free Go source,
+  compiles that to WebAssembly, and runs it live in a browser tab with no
+  server-side inference. See `examples/wasm_demo/README.md`.
 
 ## Features
 
 - **Modules** (`nn`): `Linear` (rank-agnostic — accepts any `[...,
   features]` input, not just `[batch, features]`), `Conv2D`/
   `Conv2DSame`/`Conv2DStrided`, `Conv1D`/`Conv1DSame`/`Conv1DStrided`,
-  `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D`, `Flatten`, `Dropout`,
-  `BatchNorm`, `LayerNorm`, `GroupNorm`, `Embedding`, activations
-  (`ReLU`, `Sigmoid`, `Tanh`, `LeakyReLU`, `GELU`, `Softmax`) — all
-  compose via `Sequential`, which validates the whole chain's shapes at
-  construction.
+  `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D`, `AdaptiveAvgPool2D`,
+  `GlobalAvgPool2D`, `GlobalMaxPool2D`, `Flatten`, `Dropout`, `BatchNorm`,
+  `LayerNorm`, `GroupNorm`, `InstanceNorm`, `RMSNorm`, `Embedding`,
+  activations (`ReLU`, `Sigmoid`, `Tanh`, `LeakyReLU`, `GELU`, `ELU`,
+  `SELU`, `SiLU`, `Softplus`, `Mish`, `Hardswish`, `PReLU`, `Softmax`) —
+  all compose via `Sequential`, which validates the whole chain's shapes
+  at construction.
+- **Recurrent layers** (`nn`): `RNN`, `LSTM`, `GRU` — `[batch, seqLen,
+  features]` in, `[batch, seqLen, hidden]` out (every timestep, not just
+  the last), with full backpropagation-through-time; `LastTimestep()`
+  composes after them to reduce to `[batch, hidden]` for sequence
+  classification. Unidirectional only.
 - **Composite modules**: `Residual(shortcut, inner...)` for ResNet-style
   skip connections (identity or projection shortcut); `Frozen(module)`
   excludes a layer's weights from optimizer updates for fine-tuning,
   while gradients still flow through it to earlier layers.
 - **Attention** (`nn`): `MultiHeadAttention` (self-attention, causal or
   non-causal masking, implements `Module` so it composes normally),
+  `RotaryMultiHeadAttention` (the same, using RoPE for relative-position-
+  aware attention instead of an added positional embedding),
   `CrossAttention` (query/context attention with independent sequence
   lengths — takes two inputs, so it's called directly rather than
   composed via `Sequential`), `PositionalEmbedding`, and
@@ -101,20 +118,27 @@ Nine runnable examples live in `examples/` — run any of them with
 - **Initializers**: Xavier, He, Zeros, Uniform, Normal — explicit
   `*rand.Rand` throughout, no global RNG state anywhere in the library.
 - **Training** (`train`): one `Trainer.Fit` loop with per-epoch shuffling,
-  batching, optional gradient clipping, and validation metrics.
+  batching, optional gradient clipping, and validation metrics, plus a
+  streaming alternative (`Trainer.FitStream`/`TrainOnBatch`, see `data`
+  below) for datasets that don't fit in memory as a single tensor.
   Optimizers: SGD, Momentum, Adam, AdamW (decoupled weight decay),
-  RMSprop, plus a `ClipNorm` wrapper. Losses: MSE, MAE, BCE,
-  CrossEntropy (with a fused softmax+cross-entropy gradient shortcut
-  when the model ends in `Softmax`).
+  RMSprop, Adagrad, Adadelta, Nadam, Lion, plus `ClipNorm`/`L1Reg`/
+  `L2Reg` wrappers (composable with each other). Losses: MSE, MAE, Huber/
+  SmoothL1, BCE, CrossEntropy (with a fused softmax+cross-entropy
+  gradient shortcut when the model ends in `Softmax`), KLDivergence,
+  Hinge, Focal, CosineSimilarity, and a `LabelSmoothing` decorator that
+  wraps any other loss.
 - **Callbacks**: `History` (always returned by `Fit`), `EarlyStopping`
   (with in-memory best-weight restore), `ModelCheckpoint`, `ProgressBar`,
-  and five LR schedulers (`StepDecay`, `ExponentialDecay`,
-  `CosineAnnealing`, `Warmup`, `ReduceLROnPlateau`).
+  five per-epoch LR schedulers (`StepDecay`, `ExponentialDecay`,
+  `CosineAnnealing`, `Warmup`, `ReduceLROnPlateau`), and two per-batch LR
+  schedulers (`OneCycleLR`, `CyclicLR`).
 - **Evaluation**: `Trainer.Evaluate` returns accuracy/precision/recall/F1/
-  confusion-matrix `Metrics`, macro-averaged for multiclass;
-  `train.KFoldSplits`/`StratifiedKFoldSplits`/`CrossValidate` for
-  cross-validation; `train.FormatConfusionMatrix` and `History.PlotLoss`
-  for terminal-friendly reporting.
+  ROC-AUC/PR-AUC/top-5-accuracy/perplexity/confusion-matrix `Metrics`,
+  macro-averaged for multiclass; `train.KFoldSplits`/
+  `StratifiedKFoldSplits`/`CrossValidate` for cross-validation;
+  `train.FormatConfusionMatrix` and `History.PlotLoss` for
+  terminal-friendly reporting.
 - **Serialization**: `nn.Save`/`nn.Load` — one JSON format for any
   module tree, from a single dense layer to a full Transformer block;
   `nn.SaveWithMetadata`/`nn.LoadWithMetadata` additionally bundle input
@@ -126,12 +150,35 @@ Nine runnable examples live in `examples/` — run any of them with
   batch/row-parallel across all CPU cores, with a GEMM-style,
   cache-friendly inner loop for the convolutions — a ~19x wall-clock
   improvement over a naive single-threaded implementation on the
-  `cifar10_cnn` benchmark. Run `go test ./nn/ -bench . -benchmem` to
-  measure on your own machine.
+  `cifar10_cnn` benchmark. The same batch/row-parallel treatment extends
+  to `train.CrossValidate` (folds run concurrently across a worker pool),
+  every `train.Optimizer`'s `Step` (large parameters split their
+  per-element update across goroutines; small ones stay inline to avoid
+  dispatch overhead), and `data.LoadImageFolder` (image decode runs across
+  a worker pool). Run `go test ./nn/ -bench . -benchmem` or
+  `go test ./train/ -bench . -benchmem` to measure on your own machine.
+  `nn.SetDeterministic(true)` forces all of the above to run
+  single-threaded when bit-exact reproducibility matters more than speed.
+
+  **On "faster than PyTorch"**: for CPU-only workloads with small-to-medium
+  batch sizes, NeuGo's pure-Go implementation avoids Python's interpreter
+  and dispatch overhead, so it can win there. It does not — and, being
+  pure Go with no BLAS/MKL/cuDNN bindings and no GPU backend, cannot in
+  general — beat PyTorch on large matrix multiplies (PyTorch's CPU path
+  is backed by hand-tuned BLAS, and its GPU path has no analog here at
+  all). Treat any specific "faster than X" claim as workload-dependent
+  and worth benchmarking on your own model and hardware, not a blanket
+  guarantee.
+- **`text`**: a dependency-free byte-level BPE tokenizer (GPT-2 style) —
+  `TrainBPE`/`Encode`/`Decode`/`Save`/`LoadBPE` — with no "unknown token"
+  case (operates on raw bytes, so `Decode(Encode(s)) == s` always holds),
+  plus `LoadLineDataset` for line-delimited corpora.
 - **`data`**: CSV loading, z-score/min-max normalization, train/val/test
-  splitting, class balancing (oversample/undersample), horizontal-flip
-  augmentation, MNIST-style and CIFAR-10/CIFAR-100 image loaders — all
-  with explicit `*rand.Rand`, no global state.
+  splitting, class balancing (oversample/undersample), augmentation
+  (horizontal flip, random rotate/crop, color jitter, cutout), an
+  ImageNet-style folder loader (`LoadImageFolder`), MNIST-style and
+  CIFAR-10/CIFAR-100 image loaders, and a `DataLoader` for the streaming
+  training path above — all with explicit `*rand.Rand`, no global state.
 - **Export** (`export`): Convert trained models to standalone Go source code
   with zero dependencies. Single-file inference functions work anywhere Go
   runs — native, WASM, TinyGo. Bit-exact parity with training engine.
@@ -142,6 +189,21 @@ Nine runnable examples live in `examples/` — run any of them with
 - **Tune** (`tune`): Parallel hyperparameter search with ASHA early stopping.
   Supports log-uniform floats, integers, and categorical choices. Runs trials
   in worker pools across all CPUs. See [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md).
+- **Developer tooling**: `neugo diff -a -b` compares two saved models'
+  architecture and per-layer weight-delta norms; `neugo new -arch -out`
+  scaffolds a working project (mlp/cnn/transformer/rnn); `nn.ShapeTrace`
+  returns per-layer shapes as data; `nn.SetDeterministic(true)` forces
+  bit-exact reproducible results regardless of `GOMAXPROCS`; `docs/LAYERS.generated.md`
+  is an always-current constructor reference (`go generate ./...`, see
+  `cmd/gendocs`); `go test -fuzz` targets gradient-check a sample of layers
+  over randomized shapes.
+- **Training visibility**: `train.TUI` — a live terminal dashboard (loss
+  sparkline, LR, gradient norm); `train.GradientHistogram` — an ASCII
+  histogram of gradient magnitudes for spotting vanishing/exploding
+  gradients; `train.ExperimentLog` — appends JSONL run/epoch records for
+  comparing sweeps later; `nn.Metadata.Manifest` — a free-form
+  reproducibility bookkeeping field (Go version, git commit,
+  hyperparameters, ...) that round-trips through `SaveWithMetadata`.
 
 ## Export Example
 
@@ -189,9 +251,10 @@ See `examples/tune_wine` and [`docs/TUNE_GUIDE.md`](docs/TUNE_GUIDE.md) for deta
 
 ## Layout
 
-    nn/       modules (dense, conv, attention, normalization), tensors, initializers, serialization
+    nn/       modules (dense, conv, recurrent, attention, normalization), tensors, initializers, serialization
     train/    trainer, optimizers, losses, callbacks, schedulers, cross-validation, reporting
-    data/     CSV/image loading, normalization, splitting, balancing, augmentation
+    data/     CSV/image loading, normalization, splitting, balancing, augmentation, streaming DataLoader
+    text/     byte-level BPE tokenizer, line-delimited corpus loader
     export/   model JSON -> dependency-free Go inference source
     serve/    HTTP serving: hot-swap, metrics, online learning, rollback
     tune/     search spaces, worker-pool random search, ASHA pruning

@@ -40,6 +40,12 @@ func TestActivationGradients(t *testing.T) {
 		{"tanh", Tanh()},
 		{"leaky_relu", LeakyReLU(0.01)},
 		{"gelu", GELU()},
+		{"elu", ELU(1.0)},
+		{"selu", SELU()},
+		{"silu", SiLU()},
+		{"softplus", Softplus()},
+		{"mish", Mish()},
+		{"hardswish", Hardswish()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			xc := x.Clone()

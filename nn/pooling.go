@@ -172,3 +172,176 @@ func (a *AvgPool2DLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error
 }
 
 func (a *AvgPool2DLayer) Params() []*Param { return nil }
+
+// adaptiveBinRange returns the [start, end) input range that output index i
+// (of outSize total) pools over, using the standard adaptive-pooling
+// formula (PyTorch's AdaptiveAvgPool2d): start = floor(i*inSize/outSize),
+// end = ceil((i+1)*inSize/outSize). Bins always cover [0, inSize) but are
+// only non-overlapping when outSize evenly divides inSize — otherwise
+// adjacent bins share their boundary element (e.g. inSize=3, outSize=2
+// gives bins [0,2) and [1,3)), which is expected/matches PyTorch, and is
+// why Backward accumulates into gradIn with += rather than assigning.
+func adaptiveBinRange(i, outSize, inSize int) (start, end int) {
+	start = i * inSize / outSize
+	end = ((i+1)*inSize + outSize - 1) / outSize
+	return
+}
+
+// AdaptiveAvgPool2DLayer average-pools [batch, h, w, c] down to a fixed
+// [batch, outH, outW, c] regardless of input spatial size, dividing h and w
+// into outH/outW (possibly unevenly sized) contiguous bins.
+type AdaptiveAvgPool2DLayer struct {
+	outH, outW int
+	inputShape []int
+}
+
+func AdaptiveAvgPool2D(outH, outW int) *AdaptiveAvgPool2DLayer {
+	return &AdaptiveAvgPool2DLayer{outH: outH, outW: outW}
+}
+
+// GlobalAvgPool2D averages every spatial position down to a single value
+// per channel — AdaptiveAvgPool2D(1, 1).
+func GlobalAvgPool2D() *AdaptiveAvgPool2DLayer { return AdaptiveAvgPool2D(1, 1) }
+
+func (a *AdaptiveAvgPool2DLayer) OutputShape(inShape []int) ([]int, error) {
+	if len(inShape) != 4 {
+		return nil, fmt.Errorf("nn: AdaptiveAvgPool2D expects input shape [batch, h, w, c], got %v", inShape)
+	}
+	if a.outH <= 0 || a.outW <= 0 || a.outH > inShape[1] || a.outW > inShape[2] {
+		return nil, fmt.Errorf("nn: AdaptiveAvgPool2D target size (%d, %d) must be positive and no larger than input spatial size (%d, %d)", a.outH, a.outW, inShape[1], inShape[2])
+	}
+	return []int{inShape[0], a.outH, a.outW, inShape[3]}, nil
+}
+
+func (a *AdaptiveAvgPool2DLayer) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
+	if _, err := a.OutputShape(x.Shape); err != nil {
+		return nil, err
+	}
+	a.inputShape = x.Shape
+	batch, h, w, ch := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
+	out := NewTensor([]int{batch, a.outH, a.outW, ch})
+
+	// Batch-parallel: out writes are per-b disjoint.
+	parallelChunks(batch, func(_, bStart, bEnd int) {
+		for b := bStart; b < bEnd; b++ {
+			for oh := 0; oh < a.outH; oh++ {
+				hStart, hEnd := adaptiveBinRange(oh, a.outH, h)
+				for ow := 0; ow < a.outW; ow++ {
+					wStart, wEnd := adaptiveBinRange(ow, a.outW, w)
+					area := float32((hEnd - hStart) * (wEnd - wStart))
+					for c := 0; c < ch; c++ {
+						var sum float32
+						for ih := hStart; ih < hEnd; ih++ {
+							for iw := wStart; iw < wEnd; iw++ {
+								sum += x.Data[((b*h+ih)*w+iw)*ch+c]
+							}
+						}
+						out.Data[((b*a.outH+oh)*a.outW+ow)*ch+c] = sum / area
+					}
+				}
+			}
+		}
+	})
+	return out, nil
+}
+
+func (a *AdaptiveAvgPool2DLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
+	gradIn := NewTensor(a.inputShape)
+	batch, h, w, ch := a.inputShape[0], a.inputShape[1], a.inputShape[2], a.inputShape[3]
+
+	// Batch-parallel: gradIn writes are per-b disjoint across goroutines
+	// (bins never cross batch elements); within one b, bins may overlap
+	// when outH/outW don't evenly divide h/w, so accumulation into gradIn
+	// uses += and relies on that inner loop staying single-threaded.
+	parallelChunks(batch, func(_, bStart, bEnd int) {
+		for b := bStart; b < bEnd; b++ {
+			for oh := 0; oh < a.outH; oh++ {
+				hStart, hEnd := adaptiveBinRange(oh, a.outH, h)
+				for ow := 0; ow < a.outW; ow++ {
+					wStart, wEnd := adaptiveBinRange(ow, a.outW, w)
+					area := float32((hEnd - hStart) * (wEnd - wStart))
+					for c := 0; c < ch; c++ {
+						g := gradOut.Data[((b*a.outH+oh)*a.outW+ow)*ch+c] / area
+						for ih := hStart; ih < hEnd; ih++ {
+							for iw := wStart; iw < wEnd; iw++ {
+								gradIn.Data[((b*h+ih)*w+iw)*ch+c] += g
+							}
+						}
+					}
+				}
+			}
+		}
+	})
+	return gradIn, nil
+}
+
+func (a *AdaptiveAvgPool2DLayer) Params() []*Param { return nil }
+
+// GlobalMaxPool2DLayer max-pools every spatial position down to a single
+// value per channel: [batch, h, w, c] -> [batch, 1, 1, c].
+type GlobalMaxPool2DLayer struct {
+	inputShape []int
+	maxIdx     []int // per (batch, channel): flat input index of the max
+}
+
+func GlobalMaxPool2D() *GlobalMaxPool2DLayer { return &GlobalMaxPool2DLayer{} }
+
+func (g *GlobalMaxPool2DLayer) OutputShape(inShape []int) ([]int, error) {
+	if len(inShape) != 4 {
+		return nil, fmt.Errorf("nn: GlobalMaxPool2D expects input shape [batch, h, w, c], got %v", inShape)
+	}
+	return []int{inShape[0], 1, 1, inShape[3]}, nil
+}
+
+func (g *GlobalMaxPool2DLayer) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
+	if _, err := g.OutputShape(x.Shape); err != nil {
+		return nil, err
+	}
+	g.inputShape = x.Shape
+	batch, h, w, ch := x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3]
+	out := NewTensor([]int{batch, 1, 1, ch})
+	g.maxIdx = make([]int, batch*ch)
+
+	// Batch-parallel: out and maxIdx writes are per-b disjoint.
+	parallelChunks(batch, func(_, bStart, bEnd int) {
+		for b := bStart; b < bEnd; b++ {
+			for c := 0; c < ch; c++ {
+				best := float32(0)
+				bestIdx := -1
+				for ih := 0; ih < h; ih++ {
+					for iw := 0; iw < w; iw++ {
+						idx := ((b*h+ih)*w+iw)*ch + c
+						v := x.Data[idx]
+						if bestIdx == -1 || v > best {
+							best = v
+							bestIdx = idx
+						}
+					}
+				}
+				out.Data[b*ch+c] = best
+				g.maxIdx[b*ch+c] = bestIdx
+			}
+		}
+	})
+	return out, nil
+}
+
+func (g *GlobalMaxPool2DLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
+	gradIn := NewTensor(g.inputShape)
+	batch, ch := g.inputShape[0], g.inputShape[3]
+
+	// Batch-parallel: a global max's source index always lies within its
+	// own batch element, so gradIn writes from different chunks never
+	// collide.
+	parallelChunks(batch, func(_, bStart, bEnd int) {
+		for b := bStart; b < bEnd; b++ {
+			for c := 0; c < ch; c++ {
+				i := b*ch + c
+				gradIn.Data[g.maxIdx[i]] += gradOut.Data[i]
+			}
+		}
+	})
+	return gradIn, nil
+}
+
+func (g *GlobalMaxPool2DLayer) Params() []*Param { return nil }

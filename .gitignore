@@ -7,6 +7,11 @@ test_predictions.csv
 *.test
 *.out
 
+# examples/wasm_demo build output — regenerate with
+# examples/wasm_demo/build.sh rather than committing them.
+examples/wasm_demo/predict.wasm
+examples/wasm_demo/wasm_exec.js
+
 # Large real datasets downloaded on-demand by examples/cifar10_cnn and
 # examples/cifar100_cnn (~170MB/~160MB from cs.toronto.edu) — re-download
 # with `go run ./examples/cifar10_cnn` / `cifar100_cnn` rather than
@@ -25,3 +30,4 @@ dataset/train_set/x_train.csv
 
 # examples/cifar10_cnn showcase checkpoint — see model-artifacts comment above.
 cifar_10
+website/

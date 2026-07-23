@@ -118,3 +118,37 @@ func TestConv2DSameGradients(t *testing.T) {
 	ctx := &Context{Mode: Inference}
 	checkInputGradient(t, c, ctx, x)
 }
+
+// FuzzConv2DGradient fuzzes over shape dimensions ("same" padding, so any
+// odd kernel size is valid regardless of spatial size — see Conv2DSame's
+// doc comment), looking for any combination where the analytic and
+// numeric gradients disagree.
+func FuzzConv2DGradient(f *testing.F) {
+	f.Add(1, 4, 4, 1, 2, 1)
+	f.Add(2, 3, 3, 2, 1, 2)
+	f.Fuzz(func(t *testing.T, batch, h, w, inChannels, outChannels, kernelPick int) {
+		batch = clampDim(batch, 1, 3)
+		h = clampDim(h, 2, 6)
+		w = clampDim(w, 2, 6)
+		inChannels = clampDim(inChannels, 1, 3)
+		outChannels = clampDim(outChannels, 1, 3)
+		kernelSize := clampDim(kernelPick, 0, 2)*2 + 1 // odd: 1, 3, or 5
+
+		rng := NewRNG(1)
+		c := Conv2DSame(rng, inChannels, outChannels, kernelSize, HeInit())
+		if _, err := c.OutputShape([]int{batch, h, w, inChannels}); err != nil {
+			t.Skip("shape combination rejected by OutputShape:", err)
+		}
+		x := NewTensor([]int{batch, h, w, inChannels})
+		for i := range x.Data {
+			x.Data[i] = float32((i*7+h+w)%11)*0.05 - 0.25
+		}
+		ctx := &Context{Mode: Train}
+		checkInputGradient(t, c, ctx, x)
+		forward := func() (*Tensor, error) { return c.Forward(ctx, x) }
+		backward := func(g *Tensor) (*Tensor, error) { return c.Backward(ctx, g) }
+		for _, p := range c.Params() {
+			checkParamGradient(t, forward, backward, p)
+		}
+	})
+}

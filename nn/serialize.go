@@ -86,6 +86,32 @@ type leakyReLUConfig struct {
 	Alpha float32 `json:"alpha"`
 }
 
+type eluConfig struct {
+	Alpha float32 `json:"alpha"`
+}
+
+type preluConfig struct {
+	Channels int `json:"channels"`
+}
+
+type rmsNormConfig struct {
+	Channels int `json:"channels"`
+}
+
+type instanceNormConfig struct {
+	Channels int `json:"channels"`
+}
+
+type adaptiveAvgPool2DConfig struct {
+	OutH int `json:"out_h"`
+	OutW int `json:"out_w"`
+}
+
+type rnnConfig struct {
+	Features int `json:"features"`
+	Hidden   int `json:"hidden"`
+}
+
 type multiHeadAttentionConfig struct {
 	DModel   int  `json:"d_model"`
 	NumHeads int  `json:"num_heads"`
@@ -120,6 +146,10 @@ func encodeModule(m Module) (moduleDoc, error) {
 		return moduleDoc{Type: "maxpool2d", Config: mustMarshal(poolConfig{PoolSize: v.poolSize, Stride: v.stride})}, nil
 	case *AvgPool2DLayer:
 		return moduleDoc{Type: "avgpool2d", Config: mustMarshal(poolConfig{PoolSize: v.poolSize, Stride: v.stride})}, nil
+	case *AdaptiveAvgPool2DLayer:
+		return moduleDoc{Type: "adaptive_avgpool2d", Config: mustMarshal(adaptiveAvgPool2DConfig{OutH: v.outH, OutW: v.outW})}, nil
+	case *GlobalMaxPool2DLayer:
+		return moduleDoc{Type: "global_maxpool2d"}, nil
 	case *FlattenLayer:
 		return moduleDoc{Type: "flatten"}, nil
 	case *DropoutLayer:
@@ -128,6 +158,12 @@ func encodeModule(m Module) (moduleDoc, error) {
 		return moduleDoc{
 			Type:   "batchnorm",
 			Config: mustMarshal(batchNormConfig{Channels: v.channels, RunningMean: v.runningMean, RunningVar: v.runningVar}),
+			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma), "beta": toParamDoc(v.Beta)},
+		}, nil
+	case *InstanceNormLayer:
+		return moduleDoc{
+			Type:   "instancenorm",
+			Config: mustMarshal(instanceNormConfig{Channels: v.channels}),
 			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma), "beta": toParamDoc(v.Beta)},
 		}, nil
 	case *GroupNormLayer:
@@ -141,6 +177,12 @@ func encodeModule(m Module) (moduleDoc, error) {
 			Type:   "layernorm",
 			Config: mustMarshal(layerNormConfig{Channels: v.channels}),
 			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma), "beta": toParamDoc(v.Beta)},
+		}, nil
+	case *RMSNormLayer:
+		return moduleDoc{
+			Type:   "rmsnorm",
+			Config: mustMarshal(rmsNormConfig{Channels: v.channels}),
+			Params: map[string]paramDoc{"gamma": toParamDoc(v.Gamma)},
 		}, nil
 	case *EmbeddingLayer:
 		return moduleDoc{
@@ -182,6 +224,28 @@ func encodeModule(m Module) (moduleDoc, error) {
 			Config:  mustMarshal(multiHeadAttentionConfig{DModel: v.dModel, NumHeads: v.numHeads, Causal: v.causal}),
 			Modules: []moduleDoc{wqDoc, wkDoc, wvDoc, woDoc},
 		}, nil
+	case *RotaryMultiHeadAttentionLayer:
+		wqDoc, err := encodeModule(v.wq)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		wkDoc, err := encodeModule(v.wk)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		wvDoc, err := encodeModule(v.wv)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		woDoc, err := encodeModule(v.wo)
+		if err != nil {
+			return moduleDoc{}, err
+		}
+		return moduleDoc{
+			Type:    "rotary_multihead_attention",
+			Config:  mustMarshal(multiHeadAttentionConfig{DModel: v.dModel, NumHeads: v.numHeads, Causal: v.causal}),
+			Modules: []moduleDoc{wqDoc, wkDoc, wvDoc, woDoc},
+		}, nil
 	case *PositionalEmbeddingLayer:
 		embedDoc, err := encodeModule(v.embed)
 		if err != nil {
@@ -198,13 +262,42 @@ func encodeModule(m Module) (moduleDoc, error) {
 			return moduleDoc{}, err
 		}
 		return moduleDoc{Type: "frozen", Modules: []moduleDoc{innerDoc}}, nil
+	case *RNNLayer:
+		return moduleDoc{
+			Type:   "rnn",
+			Config: mustMarshal(rnnConfig{Features: v.features, Hidden: v.hidden}),
+			Params: map[string]paramDoc{"Wx": toParamDoc(v.Wx), "Wh": toParamDoc(v.Wh), "B": toParamDoc(v.B)},
+		}, nil
+	case *LSTMLayer:
+		return moduleDoc{
+			Type:   "lstm",
+			Config: mustMarshal(rnnConfig{Features: v.features, Hidden: v.hidden}),
+			Params: map[string]paramDoc{"Wx": toParamDoc(v.Wx), "Wh": toParamDoc(v.Wh), "B": toParamDoc(v.B)},
+		}, nil
+	case *GRULayer:
+		return moduleDoc{
+			Type:   "gru",
+			Config: mustMarshal(rnnConfig{Features: v.features, Hidden: v.hidden}),
+			Params: map[string]paramDoc{"Wx": toParamDoc(v.Wx), "Wh": toParamDoc(v.Wh), "Bx": toParamDoc(v.Bx), "Bh": toParamDoc(v.Bh)},
+		}, nil
+	case *LastTimestepLayer:
+		return moduleDoc{Type: "last_timestep"}, nil
 	case *SoftmaxModule:
 		return moduleDoc{Type: "softmax"}, nil
 	case *ActivationModule:
 		if v.Name() == "leaky_relu" {
 			return moduleDoc{Type: "leaky_relu", Config: mustMarshal(leakyReLUConfig{Alpha: v.Alpha()})}, nil
 		}
+		if v.Name() == "elu" {
+			return moduleDoc{Type: "elu", Config: mustMarshal(eluConfig{Alpha: v.Alpha()})}, nil
+		}
 		return moduleDoc{Type: v.Name()}, nil
+	case *PReLULayer:
+		return moduleDoc{
+			Type:   "prelu",
+			Config: mustMarshal(preluConfig{Channels: v.channels}),
+			Params: map[string]paramDoc{"alpha": toParamDoc(v.Alpha)},
+		}, nil
 	case *SequentialModel:
 		children := make([]moduleDoc, len(v.modules))
 		for i, cm := range v.modules {
@@ -359,6 +452,19 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		}
 		return AvgPool2D(cfg.PoolSize, cfg.Stride), nil
 
+	case "adaptive_avgpool2d":
+		var cfg adaptiveAvgPool2DConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: adaptive_avgpool2d config: %w", err)
+		}
+		if cfg.OutH <= 0 || cfg.OutW <= 0 {
+			return nil, fmt.Errorf("nn: Load: adaptive_avgpool2d config: out_h and out_w must be positive, got %d and %d", cfg.OutH, cfg.OutW)
+		}
+		return AdaptiveAvgPool2D(cfg.OutH, cfg.OutW), nil
+
+	case "global_maxpool2d":
+		return GlobalMaxPool2D(), nil
+
 	case "flatten":
 		return Flatten(), nil
 
@@ -454,6 +560,52 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		copy(ln.Gamma.Value.Data, gamma.Data)
 		copy(ln.Beta.Value.Data, beta.Data)
 		return ln, nil
+
+	case "rmsnorm":
+		var cfg rmsNormConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: rmsnorm config: %w", err)
+		}
+		if cfg.Channels <= 0 {
+			return nil, fmt.Errorf("nn: Load: rmsnorm config: channels must be positive, got %d", cfg.Channels)
+		}
+		rn := RMSNorm(cfg.Channels)
+		gamma, err := paramOrErr(doc, "gamma", "rmsnorm")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("rmsnorm", "gamma", len(rn.Gamma.Value.Data), gamma); err != nil {
+			return nil, err
+		}
+		copy(rn.Gamma.Value.Data, gamma.Data)
+		return rn, nil
+
+	case "instancenorm":
+		var cfg instanceNormConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: instancenorm config: %w", err)
+		}
+		if cfg.Channels <= 0 {
+			return nil, fmt.Errorf("nn: Load: instancenorm config: channels must be positive, got %d", cfg.Channels)
+		}
+		in := InstanceNorm(cfg.Channels)
+		gamma, err := paramOrErr(doc, "gamma", "instancenorm")
+		if err != nil {
+			return nil, err
+		}
+		beta, err := paramOrErr(doc, "beta", "instancenorm")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("instancenorm", "gamma", len(in.Gamma.Value.Data), gamma); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("instancenorm", "beta", len(in.Beta.Value.Data), beta); err != nil {
+			return nil, err
+		}
+		copy(in.Gamma.Value.Data, gamma.Data)
+		copy(in.Beta.Value.Data, beta.Data)
+		return in, nil
 
 	case "embedding":
 		var cfg embeddingConfig
@@ -559,6 +711,34 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		m.wq, m.wk, m.wv, m.wo = linears[0], linears[1], linears[2], linears[3]
 		return m, nil
 
+	case "rotary_multihead_attention":
+		var cfg multiHeadAttentionConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: rotary_multihead_attention config: %w", err)
+		}
+		if cfg.DModel <= 0 || cfg.NumHeads <= 0 || cfg.DModel%cfg.NumHeads != 0 {
+			return nil, fmt.Errorf("nn: Load: rotary_multihead_attention config: d_model %d must be positive and evenly divisible by num_heads %d", cfg.DModel, cfg.NumHeads)
+		}
+		if len(doc.Modules) != 4 {
+			return nil, fmt.Errorf("nn: Load: rotary_multihead_attention must have 4 nested modules (wq,wk,wv,wo), got %d", len(doc.Modules))
+		}
+		names := [4]string{"wq", "wk", "wv", "wo"}
+		linears := [4]*LinearLayer{}
+		for i, name := range names {
+			mod, err := decodeModule(doc.Modules[i], rng)
+			if err != nil {
+				return nil, err
+			}
+			lin, ok := mod.(*LinearLayer)
+			if !ok {
+				return nil, fmt.Errorf("nn: Load: rotary_multihead_attention %s must be a linear module", name)
+			}
+			linears[i] = lin
+		}
+		m := RotaryMultiHeadAttention(rng, cfg.DModel, cfg.NumHeads, cfg.Causal, ZerosInit())
+		m.wq, m.wk, m.wv, m.wo = linears[0], linears[1], linears[2], linears[3]
+		return m, nil
+
 	case "positional_embedding":
 		var cfg positionalEmbeddingConfig
 		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
@@ -590,6 +770,122 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 		}
 		return &FrozenModule{inner: inner}, nil
 
+	case "rnn":
+		var cfg rnnConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: rnn config: %w", err)
+		}
+		if cfg.Features <= 0 || cfg.Hidden <= 0 {
+			return nil, fmt.Errorf("nn: Load: rnn config: features and hidden must be positive, got %d and %d", cfg.Features, cfg.Hidden)
+		}
+		r := RNN(rng, cfg.Features, cfg.Hidden, ZerosInit())
+		wx, err := paramOrErr(doc, "Wx", "rnn")
+		if err != nil {
+			return nil, err
+		}
+		wh, err := paramOrErr(doc, "Wh", "rnn")
+		if err != nil {
+			return nil, err
+		}
+		b, err := paramOrErr(doc, "B", "rnn")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("rnn", "Wx", len(r.Wx.Value.Data), wx); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("rnn", "Wh", len(r.Wh.Value.Data), wh); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("rnn", "B", len(r.B.Value.Data), b); err != nil {
+			return nil, err
+		}
+		copy(r.Wx.Value.Data, wx.Data)
+		copy(r.Wh.Value.Data, wh.Data)
+		copy(r.B.Value.Data, b.Data)
+		return r, nil
+
+	case "lstm":
+		var cfg rnnConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: lstm config: %w", err)
+		}
+		if cfg.Features <= 0 || cfg.Hidden <= 0 {
+			return nil, fmt.Errorf("nn: Load: lstm config: features and hidden must be positive, got %d and %d", cfg.Features, cfg.Hidden)
+		}
+		l := LSTM(rng, cfg.Features, cfg.Hidden, ZerosInit())
+		wx, err := paramOrErr(doc, "Wx", "lstm")
+		if err != nil {
+			return nil, err
+		}
+		wh, err := paramOrErr(doc, "Wh", "lstm")
+		if err != nil {
+			return nil, err
+		}
+		b, err := paramOrErr(doc, "B", "lstm")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("lstm", "Wx", len(l.Wx.Value.Data), wx); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("lstm", "Wh", len(l.Wh.Value.Data), wh); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("lstm", "B", len(l.B.Value.Data), b); err != nil {
+			return nil, err
+		}
+		copy(l.Wx.Value.Data, wx.Data)
+		copy(l.Wh.Value.Data, wh.Data)
+		copy(l.B.Value.Data, b.Data)
+		return l, nil
+
+	case "gru":
+		var cfg rnnConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: gru config: %w", err)
+		}
+		if cfg.Features <= 0 || cfg.Hidden <= 0 {
+			return nil, fmt.Errorf("nn: Load: gru config: features and hidden must be positive, got %d and %d", cfg.Features, cfg.Hidden)
+		}
+		g := GRU(rng, cfg.Features, cfg.Hidden, ZerosInit())
+		wx, err := paramOrErr(doc, "Wx", "gru")
+		if err != nil {
+			return nil, err
+		}
+		wh, err := paramOrErr(doc, "Wh", "gru")
+		if err != nil {
+			return nil, err
+		}
+		bx, err := paramOrErr(doc, "Bx", "gru")
+		if err != nil {
+			return nil, err
+		}
+		bh, err := paramOrErr(doc, "Bh", "gru")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("gru", "Wx", len(g.Wx.Value.Data), wx); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("gru", "Wh", len(g.Wh.Value.Data), wh); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("gru", "Bx", len(g.Bx.Value.Data), bx); err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("gru", "Bh", len(g.Bh.Value.Data), bh); err != nil {
+			return nil, err
+		}
+		copy(g.Wx.Value.Data, wx.Data)
+		copy(g.Wh.Value.Data, wh.Data)
+		copy(g.Bx.Value.Data, bx.Data)
+		copy(g.Bh.Value.Data, bh.Data)
+		return g, nil
+
+	case "last_timestep":
+		return LastTimestep(), nil
+
 	case "softmax":
 		return Softmax(), nil
 	case "relu":
@@ -606,6 +902,40 @@ func decodeModule(doc moduleDoc, rng *rand.Rand) (Module, error) {
 			return nil, fmt.Errorf("nn: Load: leaky_relu config: %w", err)
 		}
 		return LeakyReLU(cfg.Alpha), nil
+	case "elu":
+		var cfg eluConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: elu config: %w", err)
+		}
+		return ELU(cfg.Alpha), nil
+	case "selu":
+		return SELU(), nil
+	case "silu":
+		return SiLU(), nil
+	case "mish":
+		return Mish(), nil
+	case "softplus":
+		return Softplus(), nil
+	case "hardswish":
+		return Hardswish(), nil
+	case "prelu":
+		var cfg preluConfig
+		if err := json.Unmarshal(doc.Config, &cfg); err != nil {
+			return nil, fmt.Errorf("nn: Load: prelu config: %w", err)
+		}
+		if cfg.Channels <= 0 {
+			return nil, fmt.Errorf("nn: Load: prelu config: channels must be positive, got %d", cfg.Channels)
+		}
+		pr := PReLU(cfg.Channels)
+		a, err := paramOrErr(doc, "alpha", "prelu")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkParamLen("prelu", "alpha", len(pr.Alpha.Value.Data), a); err != nil {
+			return nil, err
+		}
+		copy(pr.Alpha.Value.Data, a.Data)
+		return pr, nil
 
 	case "sequential":
 		children := make([]Module, len(doc.Modules))
@@ -704,6 +1034,19 @@ type Metadata struct {
 	InputShape    []int               `json:"input_shape,omitempty"`
 	ClassNames    []string            `json:"class_names,omitempty"`
 	Normalization *NormalizationStats `json:"normalization,omitempty"`
+	// Manifest is optional reproducibility bookkeeping: whatever the
+	// caller wants recorded alongside the weights — Go version, git
+	// commit, hyperparameters, dataset identifiers, random seed, whatever
+	// answers "what exactly produced this checkpoint" later. nn itself
+	// never populates this automatically (no git/exec dependency to keep
+	// this library free of — a shelled-out `git rev-parse` would also
+	// silently fail or lie in a non-git deployment); it's just a place to
+	// put arbitrary string bookkeeping so it round-trips through
+	// SaveWithMetadata/LoadWithMetadata. Values are strings rather than
+	// `any` to keep the round trip exact and typed — build whatever
+	// summary string you need (e.g. a JSON-encoded hyperparameter blob)
+	// on the caller side.
+	Manifest map[string]string `json:"manifest,omitempty"`
 }
 
 type modelDoc struct {

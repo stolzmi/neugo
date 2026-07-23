@@ -6,6 +6,20 @@ import (
 	"testing"
 )
 
+// clampDim maps an arbitrary fuzzer-supplied int (which may be negative,
+// zero, or huge) into [lo, hi] inclusive, so fuzz targets that build
+// layers/tensors from fuzzed dimensions never try to allocate something
+// absurd or construct a layer with a non-positive size. Go's %  can
+// return a negative result for a negative dividend, hence the fixup.
+func clampDim(v, lo, hi int) int {
+	span := hi - lo + 1
+	m := v % span
+	if m < 0 {
+		m += span
+	}
+	return lo + m
+}
+
 const gradCheckEps = 1e-2
 const gradCheckTol = 1e-2
 

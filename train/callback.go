@@ -161,8 +161,9 @@ func (mc *ModelCheckpointCallback) OnEpochEnd(epoch int, trainLoss float32, valM
 	}
 }
 
-// ProgressBarCallback is one of the two callbacks permitted to write to
-// stdout (the other is nn.Summary).
+// ProgressBarCallback is one of the stdout-writing callbacks in this
+// package (alongside TUICallback and GradientHistogramCallback; nn.Summary
+// is the one stdout writer outside train).
 type ProgressBarCallback struct {
 	BaseCallback
 	TotalEpochs int

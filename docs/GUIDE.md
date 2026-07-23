@@ -2,7 +2,10 @@
 
 A full walkthrough of the `nn`, `train`, and `data` packages. For a
 30-second version, see the [README](../README.md). Every snippet in this
-guide compiles against the actual API — none of it is aspirational.
+guide compiles against the actual API — none of it is aspirational. For a
+flat, auto-generated list of every layer constructor (regenerated from
+source via `go generate ./...`, see `cmd/gendocs`), see
+[`LAYERS.generated.md`](LAYERS.generated.md).
 
 ## Table of contents
 
@@ -14,7 +17,11 @@ guide compiles against the actual API — none of it is aspirational.
 6. [Evaluation and cross-validation](#6-evaluation-and-cross-validation)
 7. [Serialization](#7-serialization)
 8. [The `data` package](#8-the-data-package)
-9. [Migrating from the old `Network` API](#9-migrating-from-the-old-network-api)
+9. [Streaming training](#9-streaming-training)
+10. [Recurrent layers and RoPE attention](#10-recurrent-layers-and-rope-attention)
+11. [The `text` package](#11-the-text-package)
+12. [Developer and research tooling](#12-developer-and-research-tooling)
+13. [Migrating from the old `Network` API](#13-migrating-from-the-old-network-api)
 
 ---
 
@@ -93,15 +100,34 @@ non-nil `ctx.RNG`.
 | `Conv2DSame` | `Conv2DSame(rng *rand.Rand, inChannels, outChannels, kernelSize int, init Initializer) *Conv2DLayer` | stride-1, padding `(kernelSize-1)/2`; `kernelSize` should be odd for symmetric padding — this is the caller's responsibility, not a checked invariant |
 | `MaxPool2D` | `MaxPool2D(poolSize, stride int) *MaxPool2DLayer` | no learnable params |
 | `AvgPool2D` | `AvgPool2D(poolSize, stride int) *AvgPool2DLayer` | no learnable params |
+| `AdaptiveAvgPool2D` | `AdaptiveAvgPool2D(outH, outW int) *AdaptiveAvgPool2DLayer` | pools to a fixed output size regardless of input spatial size (bins may overlap when it doesn't divide evenly, matching PyTorch) |
+| `GlobalAvgPool2D` | `GlobalAvgPool2D() *AdaptiveAvgPool2DLayer` | sugar for `AdaptiveAvgPool2D(1, 1)` |
+| `GlobalMaxPool2D` | `GlobalMaxPool2D() *GlobalMaxPool2DLayer` | max over the entire spatial extent, per channel |
 | `Flatten` | `Flatten() *FlattenLayer` | `[batch, h, w, c]` → `[batch, h*w*c]` |
 | `Dropout` | `Dropout(rate float32) *DropoutLayer` | inverted dropout; no-op outside `Train` mode |
 | `BatchNorm` | `BatchNorm(channels int) *BatchNormLayer` | normalizes the last (channel) axis; works for both dense `[batch, features]` and conv `[batch, h, w, c]` inputs |
+| `LayerNorm` | `LayerNorm(channels int) *LayerNormLayer` | normalizes each row's `channels` independently; no running stats |
+| `GroupNorm` | `GroupNorm(groups, channels int) *GroupNormLayer` | normalizes per (sample, group) over channels+spatial |
+| `InstanceNorm` | `InstanceNorm(channels int) *InstanceNormLayer` | `GroupNorm(channels, channels)` under its own name/serialization tag — per (sample, channel), spatial-only |
+| `RMSNorm` | `RMSNorm(channels int) *RMSNormLayer` | scale-only, no mean-subtraction/bias — the LLaMA/Gemma-style LayerNorm replacement |
 | `ReLU` | `ReLU() *ActivationModule` | |
 | `Sigmoid` | `Sigmoid() *ActivationModule` | |
 | `Tanh` | `Tanh() *ActivationModule` | |
 | `LeakyReLU` | `LeakyReLU(alpha float32) *ActivationModule` | |
 | `GELU` | `GELU() *ActivationModule` | exact erf formula, not a SiLU approximation |
+| `ELU` | `ELU(alpha float32) *ActivationModule` | |
+| `SELU` | `SELU() *ActivationModule` | fixed self-normalizing constants, no configurable alpha |
+| `SiLU` | `SiLU() *ActivationModule` | aka Swish: `x*sigmoid(x)` |
+| `Softplus` | `Softplus() *ActivationModule` | `log(1+exp(x))`, numerically stable for large \|x\| |
+| `Mish` | `Mish() *ActivationModule` | `x*tanh(softplus(x))` |
+| `Hardswish` | `Hardswish() *ActivationModule` | piecewise-linear SiLU approximation (MobileNetV3) |
+| `PReLU` | `PReLU(channels int) *PReLULayer` | learnable per-channel negative-slope (unlike `LeakyReLU`'s fixed `alpha`) |
 | `Softmax` | `Softmax() *SoftmaxModule` | expects `[batch, classes]`; see §3 for the fused-loss shortcut |
+| `RNN` | `RNN(rng, features, hidden int, init Initializer) *RNNLayer` | vanilla recurrent layer; see §10 |
+| `LSTM` | `LSTM(rng, features, hidden int, init Initializer) *LSTMLayer` | see §10 |
+| `GRU` | `GRU(rng, features, hidden int, init Initializer) *GRULayer` | see §10 |
+| `LastTimestep` | `LastTimestep() *LastTimestepLayer` | `[batch, seqLen, hidden]` → `[batch, hidden]`, composes after RNN/LSTM/GRU |
+| `RotaryMultiHeadAttention` | `RotaryMultiHeadAttention(rng, dModel, numHeads int, causal bool, init Initializer) *RotaryMultiHeadAttentionLayer` | `MultiHeadAttention` with RoPE instead of an added positional embedding; see §10 |
 
 If `init` is `nil`, `Linear` defaults to `XavierInit()` and `Conv2D`/
 `Conv2DSame` default to `HeInit()`.
@@ -324,28 +350,62 @@ also take when the model already ends in `Softmax`.
 train.SGD(lr float32) *SGDOptimizer
 train.Momentum(lr, beta float32) *MomentumOptimizer
 train.Adam(lr, beta1, beta2, eps float32) *AdamOptimizer
+train.AdamW(lr, beta1, beta2, eps, weightDecay float32) *AdamOptimizer
 train.RMSprop(lr, rho, eps float32) *RMSpropOptimizer
+train.Adagrad(lr, eps float32) *AdagradOptimizer
+train.Adadelta(lr, rho, eps float32) *AdadeltaOptimizer
+train.Nadam(lr, beta1, beta2, eps float32) *NadamOptimizer
+train.Lion(lr, beta1, beta2 float32) *LionOptimizer
 train.ClipNorm(inner Optimizer, maxNorm float32) *ClipNormOptimizer
+train.L1Reg(inner Optimizer, lambda float32) *L1RegOptimizer
+train.L2Reg(inner Optimizer, lambda float32) *L2RegOptimizer
 ```
 
-All four base optimizers implement `Optimizer` (`Step([]*nn.Param)`,
+Every optimizer implements `Optimizer` (`Step([]*nn.Param)`,
 `SetLR(float32)`, `GetLR() float32`); `SetLR`/`GetLR` are what the
-schedulers in §4 call every epoch. `ClipNorm` wraps any of them —
-`Trainer.Fit`'s `ClipGrad` option builds exactly this wrapper for you,
-but you can also construct one directly if you're driving training
-without `Fit`.
+schedulers in §4 call every epoch. `ClipNorm`/`L1Reg`/`L2Reg` all wrap
+another `Optimizer` and are composable with each other (e.g.
+`L2Reg(ClipNorm(Adam(...), 1.0), 1e-4)`) — `Trainer.Fit`'s `ClipGrad`
+option builds a `ClipNorm` wrapper for you, but `L1Reg`/`L2Reg` (classical
+gradient-based regularization, distinct from `AdamW`'s decoupled
+`WeightDecay`) are always constructed directly around whichever optimizer
+you pass to `train.New`. `Nadam` needs its own step counter like `Adam`;
+`Lion` steps by the *sign* of an interpolated momentum term, so every
+parameter moves by the same size step each update, scaled only by `LR`.
+
+Every optimizer's `Step` splits each parameter's per-element update across
+goroutines once that parameter is large enough (~4096 elements) for the
+dispatch overhead to pay off — small parameters (biases, norm scales)
+always run inline. This is transparent: the math is identical either way,
+and `nn.SetDeterministic(true)` forces the inline, single-threaded path
+everywhere, same as it does for `nn`'s own layers.
 
 ### Losses
 
 ```go
-train.MSELoss() *MeanSquaredError           // regression
-train.MAELoss() *MeanAbsoluteError          // regression, robust to outliers
-train.BCELoss() *BinaryCrossEntropy         // single-output binary classification, target in {0,1}
-train.CrossEntropy() *CrossEntropyLoss      // multiclass, target one-hot; see fused note above
+train.MSELoss() *MeanSquaredError                    // regression
+train.MAELoss() *MeanAbsoluteError                   // regression, robust to outliers
+train.HuberLoss(delta float32) *Huber                // regression, quadratic near 0 / linear beyond delta
+train.SmoothL1Loss() *Huber                          // HuberLoss(1.0)
+train.BCELoss() *BinaryCrossEntropy                  // single-output binary classification, target in {0,1}
+train.CrossEntropy() *CrossEntropyLoss               // multiclass, target one-hot; see fused note above
+train.KLDivergenceLoss() *KLDivergence               // KL(target || pred), both as [batch, classes] distributions
+train.HingeLoss() *Hinge                             // margin classification, target in {-1, +1}
+train.FocalLoss(gamma, alpha float32) *Focal         // BCE variant that down-weights easy examples
+train.CosineSimilarityLoss() *CosineSimilarity       // 1-cos_sim(pred_row, target_row), e.g. for embeddings
+train.LabelSmoothingLoss(inner Loss, epsilon float32, numClasses int) *LabelSmoothing // wraps any Loss
 ```
 
 Every `Loss` implements `Loss(pred, target *nn.Tensor) (float32, *nn.Tensor, error)`,
-returning the batch-mean scalar loss and `dLoss/dPred`.
+returning the batch-mean scalar loss and `dLoss/dPred`. `LabelSmoothing`
+is a decorator (same shape as the optimizer wrappers above): it smooths
+`target` toward `epsilon/numClasses` before delegating to `inner`, so
+`train.LabelSmoothingLoss(train.CrossEntropy(), 0.1, 10)` behaves like
+`CrossEntropy` but discourages overconfident predictions. If you want a
+label-smoothed loss to also use the fused softmax shortcut, call
+`ce.SetFused(true)` on the inner `*CrossEntropyLoss` yourself before
+wrapping it — `train.New` only auto-detects fusion on a `*CrossEntropyLoss`
+passed to it directly.
 
 ---
 
@@ -371,12 +431,25 @@ Built-in callbacks and schedulers:
   Save failures land in `.LastError` rather than aborting `Fit`.
 - `train.ProgressBar(totalEpochs, printEvery int) *ProgressBarCallback` —
   prints one line every `printEvery` epochs (and always the last one).
-- Five LR schedulers, each wrapping an `Optimizer` and adjusting its LR
-  every epoch: `train.StepDecay(opt, decayRate float32, decaySteps int)`,
+- Five per-epoch LR schedulers, each wrapping an `Optimizer` and
+  adjusting its LR from `OnEpochBegin`/`OnEpochEnd`:
+  `train.StepDecay(opt, decayRate float32, decaySteps int)`,
   `train.ExponentialDecay(opt, decayRate float32)`,
   `train.CosineAnnealing(opt, minLR float32, maxEpochs int)`,
   `train.Warmup(opt, targetLR float32, warmupSteps int)`, and
   `train.ReduceLROnPlateau(opt, factor float32, patience int, minLR float32, mode string)`.
+- Two per-*batch* LR schedulers, adjusting LR from `OnBatchEnd` instead
+  (since `Fit` has no `OnBatchBegin`/global-step hook, both keep their own
+  internal step counter incremented once per call rather than trusting
+  the `batch` argument, which resets every epoch):
+  `train.OneCycleLR(opt, maxLR float32, totalSteps int)` — Smith's
+  "1cycle" policy, cosine ramp from `maxLR/25` up to `maxLR` over the
+  first 30% of `totalSteps`, then cosine back down to `maxLR/25/1e4`;
+  construct with `totalSteps = epochs * batchesPerEpoch` — and
+  `train.CyclicLR(opt, baseLR, maxLR float32, stepSizeUp, stepSizeDown int)` —
+  a repeating triangular ramp between `baseLR` and `maxLR`. Both set the
+  optimizer's LR immediately on construction (to the schedule's step-0
+  value), then advance on every `OnBatchEnd` call.
 
 Combined example (this mirrors `examples/callbacks/main.go`):
 
@@ -542,6 +615,10 @@ type Metrics struct {
     Recall          float32
     F1Score         float32
     ConfusionMatrix [][]int
+    ROCAUC          float32
+    PRAUC           float32
+    Top5Accuracy    float32
+    Perplexity      float32
 }
 ```
 
@@ -551,6 +628,17 @@ single-output `[batch, 1]` predictions it's binary (threshold 0.5,
 predictions with `classes > 1` it's multiclass, using `argmax` per row
 and macro-averaging precision/recall (and, from those, F1) across
 classes. `Accuracy` is always a percentage (0–100).
+
+`ROCAUC`/`PRAUC` are macro-averaged one-vs-rest for multiclass (each
+class scored as its own binary problem via a rank-sum AUC / step-function
+average-precision estimator, averaged over classes that have at least one
+positive and one negative example — classes with degenerate support are
+skipped, same convention as `Precision`/`Recall`). `Top5Accuracy` is
+top-`min(5, classes)` accuracy — for the binary (`classes == 1`) case
+there's no meaningful top-5 to take, so it's just set equal to `Accuracy`
+there. `Perplexity` is `exp(Loss)` — only a meaningful quantity when the
+model was trained with a natural-log cross-entropy loss, but it's
+populated regardless of which `Loss` was used.
 
 ### Cross-validation
 
@@ -569,6 +657,13 @@ building a fresh model and `Trainer` inside `trainFold`, since the whole
 point of a fold is an independent training run — and returns a
 `CrossValResult` with per-fold `Metrics` plus mean/std of accuracy, F1,
 and loss across folds, and the index of the best/worst fold by accuracy.
+
+Folds run concurrently across a worker pool bounded by `GOMAXPROCS`
+(mirroring `tune.Run`'s pattern), so `trainFold` must be safe to call from
+multiple goroutines at once — in practice this just falls out of building
+a fresh model/optimizer per call, which the example below already does.
+With `nn.SetDeterministic(true)` in effect, folds instead run
+sequentially in fold order.
 
 Full example (mirrors `examples/crossval/main.go`):
 
@@ -635,14 +730,24 @@ type moduleDoc struct {
 ```
 
 A `"sequential"` root node has a `Modules` array of child nodes, one per
-layer, in order; each child has a `Type` (`"linear"`, `"conv2d"`,
-`"maxpool2d"`, `"avgpool2d"`, `"flatten"`, `"dropout"`, `"batchnorm"`,
-`"softmax"`, `"relu"`, `"sigmoid"`, `"tanh"`, `"gelu"`, or
-`"leaky_relu"`), a type-specific `Config` (e.g. `in_features`/
+layer, in order; each child has a `Type` string identifying the layer
+(`"linear"`, `"conv2d"`, `"maxpool2d"`, `"avgpool2d"`,
+`"adaptive_avgpool2d"`, `"global_maxpool2d"`, `"flatten"`, `"dropout"`,
+`"batchnorm"`, `"layernorm"`, `"groupnorm"`, `"instancenorm"`,
+`"rmsnorm"`, `"softmax"`, `"relu"`, `"sigmoid"`, `"tanh"`, `"gelu"`,
+`"elu"`, `"selu"`, `"silu"`, `"softplus"`, `"mish"`, `"hardswish"`,
+`"leaky_relu"`, `"prelu"`, `"rnn"`, `"lstm"`, `"gru"`, `"last_timestep"`,
+`"multihead_attention"`, `"rotary_multihead_attention"`,
+`"positional_embedding"`, `"embedding"`, `"conv1d"`,
+`"convtranspose2d"`, `"frozen"`, `"residual"`, or `"sequential"` for a
+nested sub-model), a type-specific `Config` (e.g. `in_features`/
 `out_features` for `"linear"`; `channels`/`running_mean`/`running_var`
 for `"batchnorm"`), and, for layers with learnable weights, a `Params`
 map (`"W"`/`"B"` for `Linear`/`Conv2D`, `"gamma"`/`"beta"` for
-`BatchNorm`) of `{shape, data}` tensors. See `nn/serialize.go` directly
+`BatchNorm`, `"Wx"`/`"Wh"`/`"B"` for `RNN`/`LSTM`, `"Wx"`/`"Wh"`/`"Bx"`/
+`"Bh"` for `GRU`) of `{shape, data}` tensors. Every stateful new layer
+type follows the same rule — a config struct plus one `case` in each
+direction of `nn/serialize.go`'s type switch — so see that file directly
 for the exact per-type config structs if you need to read or generate
 this JSON from outside Go.
 
@@ -664,6 +769,41 @@ resume an interrupted training run — loading a saved model and calling
 `Fit` again starts a brand-new optimizer from scratch on top of the
 loaded weights, not a resumed one. This is intentional (see the design
 doc's non-goals) rather than a missing feature.
+
+### `SaveWithMetadata`/`LoadWithMetadata` and reproducibility
+
+```go
+func SaveWithMetadata(model *SequentialModel, path string, meta Metadata) error
+func LoadWithMetadata(path string) (*SequentialModel, Metadata, error)
+
+type Metadata struct {
+    InputShape    []int
+    ClassNames    []string
+    Normalization *NormalizationStats
+    Manifest      map[string]string
+}
+```
+
+A distinct, opt-in file format from plain `Save`/`Load` (not
+cross-compatible — a file written by one must be read by its matching
+counterpart) that bundles inference-relevant bookkeeping alongside the
+weights. `Manifest` is free-form reproducibility bookkeeping — `nn`
+itself never populates it (no `git`/`exec` dependency to keep this
+library free of), it's just a place to put whatever answers "what
+exactly produced this checkpoint" later:
+
+```go
+meta := nn.Metadata{
+    ClassNames: []string{"cat", "dog"},
+    Manifest: map[string]string{
+        "go_version": runtime.Version(),
+        "git_commit": commitHash, // however you obtain it in your own build
+        "seed":       fmt.Sprintf("%d", seed),
+        "lr":         fmt.Sprintf("%g", lr),
+    },
+}
+nn.SaveWithMetadata(model, "checkpoint.json", meta)
+```
 
 ---
 
@@ -773,9 +913,315 @@ package. `NormalizeImages` is deterministic (it computes per-channel
 mean/std and applies them) and takes no RNG at all — there's nothing
 random about it.
 
+**Folder loader**
+
+```go
+func LoadImageFolder(root string) (*ImageDataset, []string, error)
+```
+
+Walks `root`, treating each immediate subdirectory as one class (the
+standard `root/classA/*.jpg`, `root/classB/*.png`, ... layout), decoding
+via the standard library's `image/jpeg`/`image/png` (still
+dependency-free) into 3-channel RGB `*data.Image`s normalized to `[0,1]`.
+Every image must decode to the same height/width as the first one loaded.
+Returned alongside the dataset: `classNames`, the subdirectories' sorted
+name order — also each class's one-hot index in `ImageDataset.Labels`.
+
+The directory walk is sequential, but the `image.Decode` calls — the
+expensive part for any real dataset — run across a worker pool bounded by
+`GOMAXPROCS`; the returned dataset's order and every error message are
+identical to a fully sequential load regardless.
+
+**Augmentations**
+
+Beyond `FlipHorizontal`/`AugmentWithFlips`:
+
+```go
+func RandomRotate(rng *rand.Rand, img *Image, maxDegrees float64) *Image
+func RandomCrop(rng *rand.Rand, img *Image, cropH, cropW, padding int) *Image
+func ColorJitter(rng *rand.Rand, img *Image, brightness, contrast, saturation float32) *Image
+func Cutout(rng *rand.Rand, img *Image, size int) *Image
+```
+
+`RandomRotate` bilinearly resamples around the image center, filling
+rotated-in pixels with 0. `RandomCrop` zero-pads by `padding` pixels on
+every side then takes a random `cropH x cropW` window (the standard
+CIFAR-style "pad and crop"). `ColorJitter` perturbs brightness/contrast/
+(3-channel-only) saturation, each by an independent random factor — pass
+0 for any adjustment you don't want. `Cutout` zeroes a random `size x
+size` square patch (DeVries & Taylor, 2017).
+
 ---
 
-## 9. Migrating from the old `Network` API
+## 9. Streaming training
+
+Everything above (`Trainer.Fit`) takes one fully-materialized `x, y
+*nn.Tensor` and batches internally. For datasets that don't fit in memory
+as a single tensor, `data.DataLoader` plus `Trainer.FitStream` give an
+equivalent training loop driven by a stream of index batches instead:
+
+```go
+func data.NewDataLoader(n, batchSize int, rng *rand.Rand, shuffle bool) *DataLoader
+func (d *DataLoader) Next() (batch []int, ok bool)
+func (d *DataLoader) Reset()
+
+func (t *Trainer) TrainOnBatch(xb, yb *nn.Tensor) (float32, error)
+func (t *Trainer) FitStream(loader *data.DataLoader, convert func(batchIdx []int) (*nn.Tensor, *nn.Tensor, error), opts ...FitOption) (*History, error)
+```
+
+`DataLoader` only ever yields `[]int` index batches — it stays agnostic
+to whatever actually backs your dataset (`[]*data.Image`, a lazy on-disk
+source, ...). `FitStream` calls your `convert` function once per batch to
+turn those indices into that batch's `(x, y)` tensors (mirroring
+`examples/cifar10_cnn`'s own image-to-tensor conversion — `data` still
+never imports `nn`), then trains on them via `TrainOnBatch`, the same
+forward/loss/backward/optimizer-step primitive `Fit` itself is built on
+(so the fused-softmax shortcut applies identically either way).
+`FitStream` reuses `Fit`'s `FitOption` set for `ClipGrad`/`Callbacks`/
+`Validation`/`Epochs`; `BatchSize`/`Shuffle`/`Seed` are `Fit`-only (the
+loader already owns batching, shuffling, and its own RNG) and are
+silently ignored if passed to `FitStream`.
+
+`TrainOnBatch` uses `Trainer`'s own persistent RNG (seeded 42 by default)
+across every call, rather than a fresh one per call — unlike `Fit`, which
+creates its own RNG from `Fit`'s `Seed(...)` option every time it's
+called — so Dropout-style randomness stays consistent across a whole
+streamed run.
+
+See `examples/tokenizer_stream/main.go` for a complete, runnable example
+(pairs this with the `text` package's tokenizer — §11).
+
+---
+
+## 10. Recurrent layers and RoPE attention
+
+### `RNN`, `LSTM`, `GRU`
+
+```go
+func RNN(rng *rand.Rand, features, hidden int, init Initializer) *RNNLayer
+func LSTM(rng *rand.Rand, features, hidden int, init Initializer) *LSTMLayer
+func GRU(rng *rand.Rand, features, hidden int, init Initializer) *GRULayer
+func LastTimestep() *LastTimestepLayer
+```
+
+All three share one shape contract: input `[batch, seqLen, features]`,
+output `[batch, seqLen, hidden]` — every timestep's hidden state, not
+just the last, the same way `TransformerBlock` preserves the sequence
+dimension. There's no `returnSequences` flag baked into the layer;
+compose `LastTimestep()` after it to reduce to `[batch, hidden]` for
+sequence classification, or stack another recurrent layer / a
+per-timestep `nn.Linear` (already documented as accepting any `[...,
+features]` input) directly on top:
+
+```go
+rng := nn.NewRNG(1)
+model, err := nn.Sequential([]int{batch, seqLen, vocabSize},
+    nn.Embedding(rng, vocabSize, dModel, nn.NormalInit(0, 0.5)),
+    nn.LSTM(rng, dModel, hidden, nn.XavierInit()),
+    nn.LastTimestep(),
+    nn.Linear(rng, hidden, 1, nn.XavierInit()),
+    nn.Sigmoid(),
+)
+```
+
+`LSTM`'s combined gate weights are `Wx [features, 4*hidden]`/
+`Wh [hidden, 4*hidden]` in (input, forget, cell-candidate, output) order;
+`GRU`'s are `[features/hidden, 3*hidden]` in (reset, update, candidate)
+order, with separate input-side (`Bx`) and hidden-side (`Bh`) biases
+(PyTorch's convention — the reset gate only gates the hidden-side
+contribution to the candidate, which needs the two bias vectors kept
+separate rather than combined). Backward performs full
+backpropagation-through-time: unlike every other layer in this package,
+it cannot parallelize across timesteps (each depends on the previous
+one's hidden/cell state), only across the batch dimension within a
+timestep. Unidirectional only — no bidirectional wrapper or
+packed-variable-length-sequence support (yet). See
+`examples/sequence_rnn/main.go` for a complete, runnable example.
+
+### `RotaryMultiHeadAttention`
+
+```go
+func RotaryMultiHeadAttention(rng *rand.Rand, dModel, numHeads int, causal bool, init Initializer) *RotaryMultiHeadAttentionLayer
+```
+
+Scaled-dot-product multi-head self-attention using Rotary Position
+Embedding (Su et al., 2021, "RoFormer") instead of `PositionalEmbedding`:
+Q and K are each rotated, per head and per pair of dimensions, by an
+angle proportional to sequence position before the dot product — so
+attention scores depend on *relative* position, not absolute — while V
+is left untouched. Requires an even head dimension (`dModel/numHeads`).
+Otherwise a drop-in replacement for `MultiHeadAttention` (same
+constructor shape, same `Module` interface); grouped/multi-query
+attention and KV-caching for autoregressive decoding are out of scope.
+
+---
+
+## 11. The `text` package
+
+```go
+func TrainBPE(corpus []string, vocabSize int) *BPETokenizer
+func (b *BPETokenizer) Encode(s string) []int
+func (b *BPETokenizer) Decode(ids []int) string
+func (b *BPETokenizer) VocabSize() int
+func (b *BPETokenizer) Save(path string) error
+func LoadBPE(path string) (*BPETokenizer, error)
+func LoadLineDataset(path string) ([]string, error)
+```
+
+A byte-level BPE tokenizer (GPT-2 style): the base vocabulary is exactly
+the 256 possible byte values, and every learned merge combines two
+existing token ids into one new one. Operating on raw bytes means every
+possible input string is representable — there's no "unknown token" to
+handle, and `Decode(Encode(s)) == s` always holds exactly, regardless of
+spacing or Unicode content, because merges never cross a whitespace/
+non-whitespace boundary (so no byte is ever discarded, just prevented
+from merging across that boundary).
+
+```go
+tok := text.TrainBPE(corpus, 1000) // target vocab size 1000 (clamped up to >= 256)
+ids := tok.Encode("hello, world")
+s := tok.Decode(ids) // == "hello, world"
+
+if err := tok.Save("tokenizer.json"); err != nil {
+    panic(err)
+}
+loaded, err := text.LoadBPE("tokenizer.json")
+```
+
+`LoadLineDataset` reads a line-delimited text file into `[]string`
+(skipping empty lines, stripping a trailing `\r`) — a plain corpus loader
+to pair with `TrainBPE`. See `examples/tokenizer_stream/main.go` for a
+complete example combining `text` with `data.DataLoader`/
+`Trainer.FitStream` (§9) and `nn.Embedding`/`nn.GRU` (§10).
+
+---
+
+## 12. Developer and research tooling
+
+### CLI: `neugo diff` and `neugo new`
+
+```bash
+go run ./cmd/neugo diff -a old_model.json -b new_model.json
+go run ./cmd/neugo new -arch mlp -out ./my-project -pkg main
+```
+
+`diff` compares two `nn.Save`/`nn.SaveWithMetadata` files by decoding
+their JSON directly (no dependency on `nn`'s internal types): it walks
+both module trees position by position, reporting any architecture
+difference (`TYPE CHANGED`, a module present in only one file) and, for
+every matching leaf's params, the L2 norm of the weight delta — "did my
+fine-tuning actually move this layer" at a glance, or a quick sanity check
+when reviewing a PR that touches a committed model file.
+
+`new` scaffolds a complete, working `main.go` for one of four
+architectures (`mlp`, `cnn`, `transformer`, `rnn`) into a new directory —
+the same "instant hello world" `cargo new`/`npm create` gives you, so you
+never start from a blank page. Every generated template is a real,
+compiling program against the current API (see
+`cmd/neugo/new_test.go`'s `TestNewSubcommandGeneratesBuildableProject`),
+not just a docs snippet that can silently rot.
+
+### `nn.ShapeTrace` and `nn.SetDeterministic`
+
+```go
+func ShapeTrace(model *SequentialModel, inputShape []int) ([][]int, error)
+func SetDeterministic(enabled bool)
+func IsDeterministic() bool
+```
+
+`ShapeTrace` re-runs the same `OutputShape` chain `Summary` does, but
+returns each module's output shape as `[][]int` instead of a formatted
+string — for tests/tooling that want to assert on or otherwise consume
+shapes programmatically.
+
+`SetDeterministic(true)` forces every parallelized hot path (`Conv2D`,
+`Linear`, the norm layers, attention, the RNN family, ...) to run
+single-threaded in a fixed reduction order, so repeated runs on the same
+inputs produce **bit-exact** identical results regardless of
+`GOMAXPROCS` — a process-wide switch (like `GOMAXPROCS` itself, or
+PyTorch's `use_deterministic_algorithms`), off by default since it trades
+throughput for exact reproducibility. Turn it on when you need to verify
+a paper's reported numbers or bisect a suspected numerical issue, not for
+normal training. `train`'s own parallelism (`Optimizer.Step`,
+`CrossValidate`'s fold-level concurrency) checks the same switch, so
+`SetDeterministic(true)` covers both packages with one call.
+
+### Generated docs and fuzzing
+
+`docs/LAYERS.generated.md` is a flat, always-current list of every `nn`
+constructor and its doc comment, regenerated via `go generate ./...`
+(wired through a `//go:generate` directive in `nn/doc.go` to
+`cmd/gendocs`) — it can't silently drift from the code the way a
+hand-maintained table can.
+
+A handful of layers (`Linear`, `Conv2D`, `LSTM`, `MultiHeadAttention`,
+`RMSNorm`) have `go test -fuzz` targets (e.g. `FuzzLinearGradient`) that
+fuzz over shape dimensions and run the same gradcheck helpers the
+hand-written tests use — `go test ./nn/ -fuzz=FuzzLinearGradient
+-fuzztime=30s` to fuzz one for longer than CI normally would.
+
+`nn`'s own convention of "every layer needs a serialize.go case and a
+test" is itself enforced by a test:
+`TestEveryModuleTypeHasSerializationAndTests` statically scans the
+package for types implementing `Module` and fails if either is missing —
+catching a forgotten case the moment a new layer is added.
+
+### Training visibility: `TUI`, `GradientHistogram`, `ExperimentLog`
+
+```go
+train.TUI(opt Optimizer, totalEpochs int) *TUICallback
+train.GradientHistogram(bins, printEvery int) *GradientHistogramCallback
+train.ExperimentLog(path string, meta map[string]string) *ExperimentLogCallback
+```
+
+Three opt-in `Callback`s, composed via `train.Callbacks(...)` like any
+other:
+
+- **`TUI`** redraws a compact two-line terminal dashboard in place after
+  every epoch — current loss/LR/gradient-norm, plus a Unicode-block
+  sparkline of recent training loss — using only ANSI cursor-movement
+  escapes (no external TUI library). Prefer `ProgressBar` for
+  non-interactive/redirected-to-a-file output.
+- **`GradientHistogram`** prints an ASCII log-scale histogram of gradient
+  magnitudes every `printEvery` epochs — a quick way to spot vanishing
+  (everything clustered at very negative exponents) or exploding (a long
+  tail at large positive exponents) gradients without a GUI.
+- **`ExperimentLog`** appends one JSON line per event (run start, each
+  epoch, run end) to a JSONL file, opened in append mode so multiple runs
+  (e.g. every trial in a `tune` sweep) can share one log — a dependency-
+  free alternative to an external experiment tracker for comparing sweeps
+  later. Write failures land in `.LastError`, matching
+  `ModelCheckpointCallback`'s convention, rather than panicking or failing
+  `Fit`.
+
+```go
+trainer := train.New(model, opt, train.BCELoss())
+hist, err := trainer.Fit(x, y,
+    train.Epochs(500), train.BatchSize(32),
+    train.Callbacks(
+        train.TUI(opt, 500),
+        train.GradientHistogram(10, 50),
+        train.ExperimentLog("runs.jsonl", map[string]string{"lr": "0.01"}),
+    ),
+)
+```
+
+Pair `ExperimentLog`'s JSONL output with `nn.SaveWithMetadata`'s
+`Manifest` field (§7) for full reproducibility bookkeeping: one records
+the training trajectory, the other records what produced the final
+checkpoint.
+
+### Browser demo
+
+`examples/wasm_demo` trains a small model, exports it via `export` (§
+docs/EXPORT_GUIDE.md) to dependency-free Go source, compiles that for
+`GOOS=js GOARCH=wasm`, and runs it in a browser tab with no server-side
+inference — `examples/wasm_demo/build.sh` runs the whole pipeline in one
+command; see that directory's `README.md`.
+
+---
+
+## 13. Migrating from the old `Network` API
 
 This restructure deleted the old `Network` package entirely rather than
 deprecating it — the old code had the functional bugs described in the

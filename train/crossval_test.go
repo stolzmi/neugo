@@ -3,7 +3,12 @@ package train
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/stolzmi/neugo/nn"
 )
 
 func newTestRNG(seed int64) *rand.Rand { return rand.New(rand.NewSource(seed)) }
@@ -64,13 +69,19 @@ func TestStratifiedKFoldPreservesClassRatioPerFold(t *testing.T) {
 }
 
 func TestCrossValidateAggregatesMeanAndStd(t *testing.T) {
-	folds := []Fold{{}, {}, {}} // trainFold below ignores fold contents
+	// Since folds now run concurrently, trainFold must derive its result
+	// from the fold it's given rather than a shared counter incremented
+	// in call order (call order across goroutines is not guaranteed to
+	// match fold index order) — the target accuracy is encoded in each
+	// fold's TrainX instead.
 	accuracies := []float32{60, 70, 80}
-	i := 0
+	folds := make([]Fold, len(accuracies))
+	for i, acc := range accuracies {
+		folds[i] = Fold{TrainX: [][]float32{{acc}}}
+	}
 	trainFold := func(f Fold) (Metrics, error) {
-		m := Metrics{Accuracy: accuracies[i], F1Score: accuracies[i] / 100, Loss: 1 - accuracies[i]/100}
-		i++
-		return m, nil
+		acc := f.TrainX[0][0]
+		return Metrics{Accuracy: acc, F1Score: acc / 100, Loss: 1 - acc/100}, nil
 	}
 	result, err := CrossValidate(folds, trainFold)
 	if err != nil {
@@ -81,6 +92,58 @@ func TestCrossValidateAggregatesMeanAndStd(t *testing.T) {
 	}
 	if result.BestFold != 2 || result.WorstFold != 0 {
 		t.Fatalf("BestFold=%d WorstFold=%d, want 2 and 0", result.BestFold, result.WorstFold)
+	}
+}
+
+func TestCrossValidateRunsFoldsConcurrently(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("GOMAXPROCS < 2; cannot observe concurrency")
+	}
+	numFolds := runtime.GOMAXPROCS(0) * 2
+	folds := make([]Fold, numFolds)
+
+	var active, maxActive int32
+	trainFold := func(f Fold) (Metrics, error) {
+		n := atomic.AddInt32(&active, 1)
+		for {
+			cur := atomic.LoadInt32(&maxActive)
+			if n <= cur || atomic.CompareAndSwapInt32(&maxActive, cur, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&active, -1)
+		return Metrics{}, nil
+	}
+	if _, err := CrossValidate(folds, trainFold); err != nil {
+		t.Fatalf("CrossValidate: %v", err)
+	}
+	if atomic.LoadInt32(&maxActive) < 2 {
+		t.Fatalf("max concurrent trainFold calls = %d, want >= 2 (folds should run in parallel)", maxActive)
+	}
+}
+
+func TestCrossValidateDeterministicForcesSequentialFoldOrder(t *testing.T) {
+	nn.SetDeterministic(true)
+	defer nn.SetDeterministic(false)
+
+	numFolds := 8
+	folds := make([]Fold, numFolds)
+	for i := range folds {
+		folds[i] = Fold{TrainX: [][]float32{{float32(i)}}}
+	}
+	var order []int
+	trainFold := func(f Fold) (Metrics, error) {
+		order = append(order, int(f.TrainX[0][0]))
+		return Metrics{}, nil
+	}
+	if _, err := CrossValidate(folds, trainFold); err != nil {
+		t.Fatalf("CrossValidate: %v", err)
+	}
+	for i, v := range order {
+		if v != i {
+			t.Fatalf("order[%d] = %d, want %d (SetDeterministic(true) should force sequential fold order)", i, v, i)
+		}
 	}
 }
 

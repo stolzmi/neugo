@@ -86,3 +86,30 @@ func TestLinear3DGradients(t *testing.T) {
 		checkParamGradient(t, forward, backward, p)
 	}
 }
+
+// FuzzLinearGradient fuzzes over shape dimensions rather than hand-picked
+// sizes, looking for any (batch, inFeatures, outFeatures) combination
+// where the analytic and numeric gradients disagree.
+func FuzzLinearGradient(f *testing.F) {
+	f.Add(2, 3, 4)
+	f.Add(1, 1, 1)
+	f.Fuzz(func(t *testing.T, batch, inFeatures, outFeatures int) {
+		batch = clampDim(batch, 1, 6)
+		inFeatures = clampDim(inFeatures, 1, 6)
+		outFeatures = clampDim(outFeatures, 1, 6)
+
+		rng := NewRNG(1)
+		l := Linear(rng, inFeatures, outFeatures, XavierInit())
+		x := NewTensor([]int{batch, inFeatures})
+		for i := range x.Data {
+			x.Data[i] = float32((i*7+batch+inFeatures)%13)*0.05 - 0.3
+		}
+		ctx := &Context{Mode: Train}
+		checkInputGradient(t, l, ctx, x)
+		forward := func() (*Tensor, error) { return l.Forward(ctx, x) }
+		backward := func(g *Tensor) (*Tensor, error) { return l.Backward(ctx, g) }
+		for _, p := range l.Params() {
+			checkParamGradient(t, forward, backward, p)
+		}
+	})
+}

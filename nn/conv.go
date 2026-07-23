@@ -4,7 +4,6 @@ package nn
 import (
 	"fmt"
 	"math/rand"
-	"runtime"
 )
 
 type Conv2DLayer struct {
@@ -164,7 +163,7 @@ func (c *Conv2DLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
 	// weight row, weight-gradient row, and input/gradIn channels are all
 	// contiguous. Weight-gradient partials use the transposed layout and
 	// are folded back to [oc][ic][kh][kw] in the reduce.
-	numChunks := len(chunkRanges(batch, runtime.GOMAXPROCS(0)))
+	numChunks := numParallelChunks(batch)
 	wPartials := make([][]float32, numChunks)
 	bPartials := make([][]float32, numChunks)
 	parallelChunks(batch, func(chunk, bStart, bEnd int) {

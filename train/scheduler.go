@@ -1,8 +1,8 @@
 package train
 
 import (
-	"math"
 	"github.com/stolzmi/neugo/nn"
+	"math"
 )
 
 type StepDecayScheduler struct {
@@ -78,6 +78,115 @@ func (s *WarmupScheduler) OnEpochBegin(epoch int) {
 	}
 	progress := float32(epoch) / float32(s.warmupSteps)
 	s.opt.SetLR(s.initialLR + (s.targetLR-s.initialLR)*progress)
+}
+
+// cosineInterp interpolates from start (progress=0) to end (progress=1)
+// along the same cosine curve CosineAnnealingScheduler uses, generalized
+// to work whether start < end (annealing up) or start > end (annealing
+// down) — CosineAnnealingScheduler is the start>end-only special case.
+func cosineInterp(start, end float32, progress float64) float32 {
+	cosDecay := 0.5 * (1 + math.Cos(math.Pi*progress))
+	return end + (start-end)*float32(cosDecay)
+}
+
+// OneCycleLRScheduler implements Smith's "1cycle" policy: LR rises via a
+// cosine curve from an initial LR (MaxLR/25) up to MaxLR over the first
+// PctStart fraction of TotalSteps, then anneals back down via cosine to a
+// much lower final LR (MaxLR/25/1e4) over the remaining steps. Unlike the
+// per-epoch schedulers above, it steps on OnBatchEnd — since Fit provides
+// no OnBatchBegin/global-step hook, it keeps its own counter incremented
+// once per call, ignoring the batch argument's value (which resets every
+// epoch); construct it with TotalSteps = epochs * batchesPerEpoch.
+type OneCycleLRScheduler struct {
+	BaseCallback
+	opt                       Optimizer
+	initialLR, maxLR, finalLR float32
+	pctStart                  float32
+	totalSteps                int
+	step                      int
+}
+
+func OneCycleLR(opt Optimizer, maxLR float32, totalSteps int) *OneCycleLRScheduler {
+	s := &OneCycleLRScheduler{
+		opt:        opt,
+		initialLR:  maxLR / 25,
+		maxLR:      maxLR,
+		finalLR:    maxLR / 25 / 1e4,
+		pctStart:   0.3,
+		totalSteps: totalSteps,
+	}
+	s.opt.SetLR(s.lrAt(0))
+	return s
+}
+
+func (s *OneCycleLRScheduler) lrAt(step int) float32 {
+	warmupSteps := int(float32(s.totalSteps) * s.pctStart)
+	if warmupSteps < 1 {
+		warmupSteps = 1
+	}
+	if step >= s.totalSteps {
+		step = s.totalSteps - 1
+	}
+	if step < warmupSteps {
+		return cosineInterp(s.initialLR, s.maxLR, float64(step)/float64(warmupSteps))
+	}
+	decaySteps := s.totalSteps - warmupSteps
+	if decaySteps < 1 {
+		decaySteps = 1
+	}
+	return cosineInterp(s.maxLR, s.finalLR, float64(step-warmupSteps)/float64(decaySteps))
+}
+
+func (s *OneCycleLRScheduler) OnBatchEnd(batch int, loss float32) {
+	s.step++
+	if s.step >= s.totalSteps {
+		s.opt.SetLR(s.finalLR)
+		return
+	}
+	s.opt.SetLR(s.lrAt(s.step))
+}
+
+// CyclicLRScheduler implements Smith's triangular cyclic LR policy: LR
+// ramps linearly from BaseLR up to MaxLR over StepSizeUp steps, then back
+// down to BaseLR over StepSizeDown steps, repeating indefinitely. Like
+// OneCycleLRScheduler, it steps on OnBatchEnd with its own internal
+// counter rather than the batch argument.
+type CyclicLRScheduler struct {
+	BaseCallback
+	opt                      Optimizer
+	baseLR, maxLR            float32
+	stepSizeUp, stepSizeDown int
+	step                     int
+}
+
+func CyclicLR(opt Optimizer, baseLR, maxLR float32, stepSizeUp, stepSizeDown int) *CyclicLRScheduler {
+	s := &CyclicLRScheduler{opt: opt, baseLR: baseLR, maxLR: maxLR, stepSizeUp: stepSizeUp, stepSizeDown: stepSizeDown}
+	s.opt.SetLR(s.lrAt(0))
+	return s
+}
+
+func (s *CyclicLRScheduler) lrAt(step int) float32 {
+	cycleLen := s.stepSizeUp + s.stepSizeDown
+	if cycleLen <= 0 {
+		return s.baseLR
+	}
+	pos := step % cycleLen
+	if pos < s.stepSizeUp {
+		if s.stepSizeUp == 0 {
+			return s.maxLR
+		}
+		return s.baseLR + (s.maxLR-s.baseLR)*float32(pos)/float32(s.stepSizeUp)
+	}
+	downPos := pos - s.stepSizeUp
+	if s.stepSizeDown == 0 {
+		return s.baseLR
+	}
+	return s.maxLR - (s.maxLR-s.baseLR)*float32(downPos)/float32(s.stepSizeDown)
+}
+
+func (s *CyclicLRScheduler) OnBatchEnd(batch int, loss float32) {
+	s.step++
+	s.opt.SetLR(s.lrAt(s.step))
 }
 
 type ReduceLROnPlateauScheduler struct {

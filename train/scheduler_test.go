@@ -72,6 +72,96 @@ func TestReduceLROnPlateauReducesAfterPatience(t *testing.T) {
 	}
 }
 
+func TestOneCycleLRSetsInitialLROnConstruction(t *testing.T) {
+	opt := SGD(0.1) // whatever the optimizer already had must be overridden
+	OneCycleLR(opt, 1.0, 100)
+	want := float32(1.0) / 25
+	if diff := math.Abs(float64(opt.GetLR() - want)); diff > 1e-5 {
+		t.Fatalf("LR after construction = %v, want %v (maxLR/25)", opt.GetLR(), want)
+	}
+}
+
+func TestOneCycleLRPeaksAtWarmupBoundary(t *testing.T) {
+	opt := SGD(0.0)
+	totalSteps := 100
+	s := OneCycleLR(opt, 1.0, totalSteps)
+	warmupSteps := int(float32(totalSteps) * 0.3)
+	for i := 0; i < warmupSteps; i++ {
+		s.OnBatchEnd(i, 0)
+	}
+	if diff := math.Abs(float64(opt.GetLR() - 1.0)); diff > 1e-4 {
+		t.Fatalf("LR at warmup boundary (step %d) = %v, want 1.0 (maxLR)", warmupSteps, opt.GetLR())
+	}
+}
+
+func TestOneCycleLREndsAtFinalLR(t *testing.T) {
+	opt := SGD(0.0)
+	totalSteps := 100
+	s := OneCycleLR(opt, 1.0, totalSteps)
+	for i := 0; i < totalSteps; i++ {
+		s.OnBatchEnd(i, 0)
+	}
+	want := float32(1.0) / 25 / 1e4
+	if diff := math.Abs(float64(opt.GetLR() - want)); diff > 1e-6 {
+		t.Fatalf("LR after totalSteps batches = %v, want %v (finalLR)", opt.GetLR(), want)
+	}
+	// Further calls past totalSteps must stay pinned at finalLR, not error
+	// or extrapolate past the schedule.
+	s.OnBatchEnd(totalSteps, 0)
+	if diff := math.Abs(float64(opt.GetLR() - want)); diff > 1e-6 {
+		t.Fatalf("LR past totalSteps = %v, want it to stay at finalLR %v", opt.GetLR(), want)
+	}
+}
+
+func TestOneCycleLRMonotonicWithinEachPhase(t *testing.T) {
+	opt := SGD(0.0)
+	totalSteps := 50
+	s := OneCycleLR(opt, 1.0, totalSteps)
+	warmupSteps := int(float32(totalSteps) * 0.3)
+	prev := opt.GetLR()
+	for i := 0; i < warmupSteps; i++ {
+		s.OnBatchEnd(i, 0)
+		if opt.GetLR() < prev {
+			t.Fatalf("LR decreased during warmup phase at step %d: %v -> %v", i, prev, opt.GetLR())
+		}
+		prev = opt.GetLR()
+	}
+	for i := warmupSteps; i < totalSteps; i++ {
+		s.OnBatchEnd(i, 0)
+		if opt.GetLR() > prev {
+			t.Fatalf("LR increased during decay phase at step %d: %v -> %v", i, prev, opt.GetLR())
+		}
+		prev = opt.GetLR()
+	}
+}
+
+func TestCyclicLRTriangularWave(t *testing.T) {
+	opt := SGD(0.0)
+	s := CyclicLR(opt, 0.1, 1.0, 4, 4)
+	if diff := math.Abs(float64(opt.GetLR() - 0.1)); diff > 1e-5 {
+		t.Fatalf("LR at construction = %v, want 0.1 (baseLR)", opt.GetLR())
+	}
+	for i := 0; i < 4; i++ {
+		s.OnBatchEnd(i, 0)
+	}
+	if diff := math.Abs(float64(opt.GetLR() - 1.0)); diff > 1e-5 {
+		t.Fatalf("LR after stepSizeUp batches = %v, want 1.0 (maxLR)", opt.GetLR())
+	}
+	for i := 0; i < 4; i++ {
+		s.OnBatchEnd(i, 0)
+	}
+	if diff := math.Abs(float64(opt.GetLR() - 0.1)); diff > 1e-5 {
+		t.Fatalf("LR after one full cycle = %v, want 0.1 (back to baseLR)", opt.GetLR())
+	}
+	// Second cycle repeats the same shape.
+	for i := 0; i < 4; i++ {
+		s.OnBatchEnd(i, 0)
+	}
+	if diff := math.Abs(float64(opt.GetLR() - 1.0)); diff > 1e-5 {
+		t.Fatalf("LR at peak of second cycle = %v, want 1.0 (maxLR)", opt.GetLR())
+	}
+}
+
 func TestReduceLROnPlateauRespectsMinLR(t *testing.T) {
 	opt := SGD(0.02)
 	s := ReduceLROnPlateau(opt, 0.5, 1, 0.01, "min")

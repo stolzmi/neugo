@@ -91,6 +91,120 @@ func GELU() *ActivationModule {
 	})
 }
 
+// ELU: f(x) = x for x>0, alpha*(exp(x)-1) otherwise.
+func ELU(alpha float32) *ActivationModule {
+	return newActivation("elu", alpha, activationFn{
+		apply: func(x float32) float32 {
+			if x > 0 {
+				return x
+			}
+			return alpha * (float32(math.Exp(float64(x))) - 1)
+		},
+		deriv: func(x float32) float32 {
+			if x > 0 {
+				return 1
+			}
+			return alpha * float32(math.Exp(float64(x)))
+		},
+	})
+}
+
+// selu constants from Klambauer et al., "Self-Normalizing Neural Networks".
+const (
+	seluAlpha = 1.6732632423543772
+	seluScale = 1.0507009873554805
+)
+
+// SELU is scaled ELU with the fixed constants above — no configurable
+// alpha, unlike ELU.
+func SELU() *ActivationModule {
+	return newActivation("selu", 0, activationFn{
+		apply: func(x float32) float32 {
+			if x > 0 {
+				return seluScale * x
+			}
+			return seluScale * seluAlpha * (float32(math.Exp(float64(x))) - 1)
+		},
+		deriv: func(x float32) float32 {
+			if x > 0 {
+				return seluScale
+			}
+			return seluScale * seluAlpha * float32(math.Exp(float64(x)))
+		},
+	})
+}
+
+// SiLU (aka Swish): f(x) = x*sigmoid(x).
+func SiLU() *ActivationModule {
+	sig := func(x float32) float32 { return float32(1 / (1 + math.Exp(float64(-x)))) }
+	return newActivation("silu", 0, activationFn{
+		apply: func(x float32) float32 { return x * sig(x) },
+		deriv: func(x float32) float32 {
+			s := sig(x)
+			return s + x*s*(1-s)
+		},
+	})
+}
+
+// stableSoftplus computes log(1+exp(x)) without overflowing for large |x|.
+func stableSoftplus(x float64) float64 {
+	if x > 0 {
+		return x + math.Log1p(math.Exp(-x))
+	}
+	return math.Log1p(math.Exp(x))
+}
+
+// Softplus: f(x) = log(1+exp(x)); deriv = sigmoid(x).
+func Softplus() *ActivationModule {
+	return newActivation("softplus", 0, activationFn{
+		apply: func(x float32) float32 { return float32(stableSoftplus(float64(x))) },
+		deriv: func(x float32) float32 { return float32(1 / (1 + math.Exp(float64(-x)))) },
+	})
+}
+
+// Mish: f(x) = x*tanh(softplus(x)).
+func Mish() *ActivationModule {
+	return newActivation("mish", 0, activationFn{
+		apply: func(x float32) float32 {
+			t := math.Tanh(stableSoftplus(float64(x)))
+			return float32(float64(x) * t)
+		},
+		deriv: func(x float32) float32 {
+			sp := stableSoftplus(float64(x))
+			t := math.Tanh(sp)
+			sig := 1 / (1 + math.Exp(-float64(x)))
+			return float32(t + float64(x)*(1-t*t)*sig)
+		},
+	})
+}
+
+// Hardswish: f(x) = x*relu6(x+3)/6 — a piecewise-linear approximation of
+// SiLU used by MobileNetV3.
+func Hardswish() *ActivationModule {
+	return newActivation("hardswish", 0, activationFn{
+		apply: func(x float32) float32 {
+			switch {
+			case x <= -3:
+				return 0
+			case x >= 3:
+				return x
+			default:
+				return x * (x + 3) / 6
+			}
+		},
+		deriv: func(x float32) float32 {
+			switch {
+			case x <= -3:
+				return 0
+			case x >= 3:
+				return 1
+			default:
+				return (2*x + 3) / 6
+			}
+		},
+	})
+}
+
 func (a *ActivationModule) Forward(ctx *Context, x *Tensor) (*Tensor, error) {
 	a.input = x
 	out := NewTensor(x.Shape)

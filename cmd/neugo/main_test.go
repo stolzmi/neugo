@@ -34,7 +34,7 @@ func TestExportSubcommand(t *testing.T) {
 	stderr := io.Discard
 
 	// Call run with export subcommand
-	err = run([]string{"export", "-model", modelPath, "-out", outPath, "-pkg", "mymodel"}, stderr)
+	err = run([]string{"export", "-model", modelPath, "-out", outPath, "-pkg", "mymodel"}, io.Discard, stderr)
 	if err != nil {
 		t.Fatalf("run() failed: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestExportSubcommand(t *testing.T) {
 
 func TestUnknownSubcommandErrors(t *testing.T) {
 	stderr := &bytes.Buffer{}
-	err := run([]string{"bogus"}, stderr)
+	err := run([]string{"bogus"}, io.Discard, stderr)
 	if err == nil {
 		t.Fatal("run() should return error for unknown subcommand")
 	}

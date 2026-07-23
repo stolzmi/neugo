@@ -440,6 +440,11 @@ func TestSaveLoadWithMetadataRoundTrip(t *testing.T) {
 			Mean: []float32{0.1, 0.2, 0.3},
 			Std:  []float32{0.9, 1.1, 1.0},
 		},
+		Manifest: map[string]string{
+			"go_version": "go1.22.0",
+			"git_commit": "abc1234",
+			"seed":       "42",
+		},
 	}
 	path := filepath.Join(t.TempDir(), "with_meta.json")
 	if err := SaveWithMetadata(model, path, meta); err != nil {
@@ -473,6 +478,30 @@ func TestSaveLoadWithMetadataRoundTrip(t *testing.T) {
 		if loadedMeta.Normalization.Mean[i] != want {
 			t.Errorf("Normalization.Mean[%d] = %v, want %v", i, loadedMeta.Normalization.Mean[i], want)
 		}
+	}
+	for k, want := range map[string]string{"go_version": "go1.22.0", "git_commit": "abc1234", "seed": "42"} {
+		if got := loadedMeta.Manifest[k]; got != want {
+			t.Errorf("Manifest[%q] = %q, want %q", k, got, want)
+		}
+	}
+}
+
+func TestMetadataManifestOmittedWhenNil(t *testing.T) {
+	rng := NewRNG(17)
+	model, err := Sequential([]int{1, 2}, Linear(rng, 2, 1, XavierInit()))
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "no_manifest.json")
+	if err := SaveWithMetadata(model, path, Metadata{ClassNames: []string{"a"}}); err != nil {
+		t.Fatalf("SaveWithMetadata: %v", err)
+	}
+	_, loadedMeta, err := LoadWithMetadata(path)
+	if err != nil {
+		t.Fatalf("LoadWithMetadata: %v", err)
+	}
+	if loadedMeta.Manifest != nil {
+		t.Errorf("Manifest = %v, want nil when never set", loadedMeta.Manifest)
 	}
 }
 
@@ -531,6 +560,370 @@ func TestSaveLoadCoversRemainingModuleTypes(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "remaining_types.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadNewActivationsRoundTrip(t *testing.T) {
+	model, err := Sequential([]int{1, 4}, ELU(0.7), SELU(), SiLU(), Softplus(), Mish(), Hardswish())
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	x := NewTensor([]int{1, 4})
+	for i := range x.Data {
+		x.Data[i] = float32(i)*0.3 - 0.5
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := model.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "new_activations.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+
+	// The ELU alpha must survive the round trip (not just default to 1).
+	loadedELU, ok := loaded.Modules()[0].(*ActivationModule)
+	if !ok || loadedELU.Alpha() != 0.7 {
+		t.Errorf("loaded ELU alpha = %v, want 0.7", loadedELU.Alpha())
+	}
+}
+
+func TestSaveLoadPReLURoundTrip(t *testing.T) {
+	p := PReLU(4)
+	for i := range p.Alpha.Value.Data {
+		p.Alpha.Value.Data[i] = float32(i) * 0.1
+	}
+	x := NewTensor([]int{3, 4})
+	for i := range x.Data {
+		x.Data[i] = float32(i%7)*0.2 - 0.6
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := p.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{3, 4}, p)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "prelu.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadRMSNormRoundTrip(t *testing.T) {
+	r := RMSNorm(4)
+	for i := range r.Gamma.Value.Data {
+		r.Gamma.Value.Data[i] = 1 + float32(i)*0.2
+	}
+	x := NewTensor([]int{3, 4})
+	for i := range x.Data {
+		x.Data[i] = float32(i%7)*0.15 - 0.4
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := r.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{3, 4}, r)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "rmsnorm.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadInstanceNormRoundTrip(t *testing.T) {
+	in := InstanceNorm(3)
+	x := NewTensor([]int{2, 2, 2, 3})
+	for i := range x.Data {
+		x.Data[i] = float32(i%9)*0.11 - 0.3
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := in.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{2, 2, 2, 3}, in)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "instancenorm.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadPoolingAdditionsRoundTrip(t *testing.T) {
+	model, err := Sequential([]int{1, 4, 4, 2}, AdaptiveAvgPool2D(2, 2), GlobalMaxPool2D())
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	x := NewTensor([]int{1, 4, 4, 2})
+	for i := range x.Data {
+		x.Data[i] = float32(i) * 0.05
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := model.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "pooling_additions.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadRNNRoundTrip(t *testing.T) {
+	rng := NewRNG(2)
+	r := RNN(rng, 3, 4, XavierInit())
+	x := NewTensor([]int{2, 3, 3})
+	for i := range x.Data {
+		x.Data[i] = float32(i%11)*0.08 - 0.4
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := r.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{2, 3, 3}, r)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "rnn.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadLSTMRoundTrip(t *testing.T) {
+	rng := NewRNG(3)
+	l := LSTM(rng, 3, 4, XavierInit())
+	x := NewTensor([]int{2, 3, 3})
+	for i := range x.Data {
+		x.Data[i] = float32(i%9)*0.09 - 0.4
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := l.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{2, 3, 3}, l)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "lstm.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadGRURoundTrip(t *testing.T) {
+	rng := NewRNG(4)
+	g := GRU(rng, 3, 4, XavierInit())
+	x := NewTensor([]int{2, 3, 3})
+	for i := range x.Data {
+		x.Data[i] = float32(i%13)*0.07 - 0.35
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := g.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{2, 3, 3}, g)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "gru.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadRNNThenLastTimestepRoundTrip(t *testing.T) {
+	rng := NewRNG(6)
+	model, err := Sequential([]int{2, 3, 3}, LSTM(rng, 3, 4, XavierInit()), LastTimestep())
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	x := NewTensor([]int{2, 3, 3})
+	for i := range x.Data {
+		x.Data[i] = float32(i%10) * 0.1
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := model.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "rnn_last_timestep.json")
+	if err := Save(model, path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got, err := loaded.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward loaded: %v", err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-5 {
+			t.Errorf("output[%d] = %v, want %v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+func TestSaveLoadRotaryMultiHeadAttentionRoundTrip(t *testing.T) {
+	rng := NewRNG(9)
+	m := RotaryMultiHeadAttention(rng, 4, 2, true, XavierInit())
+	x := NewTensor([]int{1, 3, 4})
+	for i := range x.Data {
+		x.Data[i] = float32(i%7)*0.1 - 0.3
+	}
+	ctx := &Context{Mode: Inference}
+	want, err := m.Forward(ctx, x)
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	model, err := Sequential([]int{1, 3, 4}, m)
+	if err != nil {
+		t.Fatalf("Sequential: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "rope.json")
 	if err := Save(model, path); err != nil {
 		t.Fatalf("Save: %v", err)
 	}

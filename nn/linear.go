@@ -4,7 +4,6 @@ package nn
 import (
 	"fmt"
 	"math/rand"
-	"runtime"
 )
 
 type LinearLayer struct {
@@ -92,7 +91,7 @@ func (l *LinearLayer) Backward(ctx *Context, gradOut *Tensor) (*Tensor, error) {
 	l.B.ZeroGrad()
 	// Row-parallel: gradIn rows are per-row disjoint; shared W/B gradients
 	// accumulate into per-chunk partials reduced in chunk order below.
-	numChunks := len(chunkRanges(rows, runtime.GOMAXPROCS(0)))
+	numChunks := numParallelChunks(rows)
 	wPartials := make([][]float32, numChunks)
 	bPartials := make([][]float32, numChunks)
 	parallelChunks(rows, func(chunk, rStart, rEnd int) {

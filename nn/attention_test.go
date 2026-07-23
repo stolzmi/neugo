@@ -177,6 +177,35 @@ func TestCrossAttentionGradientsDifferingLengths(t *testing.T) {
 	}
 }
 
+// FuzzMultiHeadAttentionGradient fuzzes over shape dimensions (batch,
+// seqLen, numHeads, headDim, and causal-or-not), looking for any
+// combination where the analytic and numeric gradients disagree.
+func FuzzMultiHeadAttentionGradient(f *testing.F) {
+	f.Add(2, 3, 2, 2, false)
+	f.Add(1, 4, 1, 4, true)
+	f.Fuzz(func(t *testing.T, batch, seqLen, numHeads, headDim int, causal bool) {
+		batch = clampDim(batch, 1, 3)
+		seqLen = clampDim(seqLen, 1, 4)
+		numHeads = clampDim(numHeads, 1, 3)
+		headDim = clampDim(headDim, 1, 3)
+		dModel := numHeads * headDim
+
+		rng := NewRNG(1)
+		m := MultiHeadAttention(rng, dModel, numHeads, causal, XavierInit())
+		x := NewTensor([]int{batch, seqLen, dModel})
+		for i := range x.Data {
+			x.Data[i] = float32((i*7+seqLen+dModel)%11)*0.05 - 0.25
+		}
+		ctx := &Context{Mode: Train}
+		checkInputGradient(t, m, ctx, x)
+		forward := func() (*Tensor, error) { return m.Forward(ctx, x) }
+		backward := func(g *Tensor) (*Tensor, error) { return m.Backward(ctx, g) }
+		for _, p := range m.Params() {
+			checkParamGradient(t, forward, backward, p)
+		}
+	})
+}
+
 func abs32(v float32) float32 {
 	if v < 0 {
 		return -v

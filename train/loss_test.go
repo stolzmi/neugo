@@ -128,6 +128,233 @@ func TestCrossEntropyFusedUsesPredDirectly(t *testing.T) {
 	}
 }
 
+// checkLossGradient verifies loss.Loss's returned gradient against central
+// finite differences of the scalar loss value, perturbing one element of
+// pred at a time — the loss-level analogue of nn's checkInputGradient.
+func checkLossGradient(t *testing.T, loss Loss, pred, target *nn.Tensor) {
+	t.Helper()
+	_, grad, err := loss.Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	const eps = 1e-3
+	for i := range pred.Data {
+		orig := pred.Data[i]
+		pred.Data[i] = orig + eps
+		lp, _, err := loss.Loss(pred, target)
+		if err != nil {
+			t.Fatalf("Loss(+eps): %v", err)
+		}
+		pred.Data[i] = orig - eps
+		lm, _, err := loss.Loss(pred, target)
+		if err != nil {
+			t.Fatalf("Loss(-eps): %v", err)
+		}
+		pred.Data[i] = orig
+		numGrad := (lp - lm) / (2 * eps)
+		if diff := math.Abs(float64(numGrad - grad.Data[i])); diff > 1e-2 {
+			t.Errorf("grad[%d] = %v, numeric = %v", i, grad.Data[i], numGrad)
+		}
+	}
+}
+
+func TestHuberLossQuadraticRegionMatchesMSEHalf(t *testing.T) {
+	// |diff| <= delta everywhere -> Huber should equal 0.5*MSE elementwise.
+	pred, _ := nn.NewTensorFromData([]float32{1, 2}, []int{1, 2})
+	target, _ := nn.NewTensorFromData([]float32{1.2, 1.7}, []int{1, 2})
+	loss, _, err := HuberLoss(1.0).Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	want := float32((0.5*0.2*0.2 + 0.5*0.3*0.3) / 2)
+	if diff := math.Abs(float64(loss - want)); diff > 1e-5 {
+		t.Fatalf("loss = %v, want %v", loss, want)
+	}
+}
+
+func TestHuberLossLinearRegionBeyondDelta(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{5}, []int{1, 1})
+	target, _ := nn.NewTensorFromData([]float32{0}, []int{1, 1})
+	loss, grad, err := HuberLoss(1.0).Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	// diff=5, delta=1: loss = delta*(|diff|-0.5*delta) = 1*(5-0.5) = 4.5
+	if diff := math.Abs(float64(loss - 4.5)); diff > 1e-5 {
+		t.Fatalf("loss = %v, want 4.5", loss)
+	}
+	if diff := math.Abs(float64(grad.Data[0] - 1.0)); diff > 1e-5 {
+		t.Fatalf("grad[0] = %v, want 1.0 (delta, since n=1)", grad.Data[0])
+	}
+}
+
+func TestHuberLossGradient(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{0.5, 2.5, -1.5, 0.1}, []int{1, 4})
+	target, _ := nn.NewTensorFromData([]float32{0.6, 0.3, 0.2, 0.1}, []int{1, 4})
+	checkLossGradient(t, HuberLoss(1.0), pred, target)
+}
+
+func TestSmoothL1LossIsHuberWithDeltaOne(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{3, -2}, []int{1, 2})
+	target, _ := nn.NewTensorFromData([]float32{0, 0}, []int{1, 2})
+	want, _, err := HuberLoss(1.0).Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	got, _, err := SmoothL1Loss().Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	if got != want {
+		t.Fatalf("SmoothL1Loss() = %v, want HuberLoss(1.0) = %v", got, want)
+	}
+}
+
+func TestKLDivergenceZeroWhenDistributionsMatch(t *testing.T) {
+	p, _ := nn.NewTensorFromData([]float32{0.2, 0.3, 0.5}, []int{1, 3})
+	loss, _, err := KLDivergenceLoss().Loss(p, p)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	if math.Abs(float64(loss)) > 1e-5 {
+		t.Fatalf("KL(p||p) = %v, want 0", loss)
+	}
+}
+
+func TestKLDivergenceGradient(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{0.6, 0.3, 0.1}, []int{1, 3})
+	target, _ := nn.NewTensorFromData([]float32{0.2, 0.5, 0.3}, []int{1, 3})
+	checkLossGradient(t, KLDivergenceLoss(), pred, target)
+}
+
+func TestHingeLossZeroWhenMarginSatisfied(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{2, -2}, []int{1, 2})
+	target, _ := nn.NewTensorFromData([]float32{1, -1}, []int{1, 2})
+	loss, grad, err := HingeLoss().Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	if loss != 0 {
+		t.Fatalf("loss = %v, want 0 (margin satisfied)", loss)
+	}
+	for i, g := range grad.Data {
+		if g != 0 {
+			t.Errorf("grad[%d] = %v, want 0", i, g)
+		}
+	}
+}
+
+func TestHingeLossPositiveWhenMarginViolated(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{0.2}, []int{1, 1})
+	target, _ := nn.NewTensorFromData([]float32{1}, []int{1, 1})
+	loss, grad, err := HingeLoss().Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	// margin = 1 - 1*0.2 = 0.8
+	if diff := math.Abs(float64(loss - 0.8)); diff > 1e-5 {
+		t.Fatalf("loss = %v, want 0.8", loss)
+	}
+	if diff := math.Abs(float64(grad.Data[0] - -1.0)); diff > 1e-5 {
+		t.Fatalf("grad[0] = %v, want -1.0 (n=1)", grad.Data[0])
+	}
+}
+
+func TestFocalLossGammaZeroAlphaHalfMatchesScaledBCE(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{0.7, 0.3}, []int{2, 1})
+	target, _ := nn.NewTensorFromData([]float32{1, 0}, []int{2, 1})
+	focalLoss, _, err := FocalLoss(0, 0.5).Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	bceLoss, _, err := BCELoss().Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	// Gamma=0 removes the focusing term; Alpha=0.5 on both classes reduces
+	// to 0.5*BCE.
+	if diff := math.Abs(float64(focalLoss - 0.5*bceLoss)); diff > 1e-4 {
+		t.Fatalf("FocalLoss(0, 0.5) = %v, want 0.5*BCE = %v", focalLoss, 0.5*bceLoss)
+	}
+}
+
+func TestFocalLossGradient(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{0.8, 0.3, 0.6, 0.1}, []int{4, 1})
+	target, _ := nn.NewTensorFromData([]float32{1, 0, 1, 0}, []int{4, 1})
+	checkLossGradient(t, FocalLoss(2.0, 0.25), pred, target)
+}
+
+func TestCosineSimilarityZeroWhenVectorsAligned(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{3, 4}, []int{1, 2})
+	target, _ := nn.NewTensorFromData([]float32{6, 8}, []int{1, 2}) // same direction, different magnitude
+	loss, _, err := CosineSimilarityLoss().Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	if math.Abs(float64(loss)) > 1e-4 {
+		t.Fatalf("loss = %v, want ~0 for aligned vectors", loss)
+	}
+}
+
+func TestCosineSimilarityMaxWhenVectorsOpposed(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{1, 0}, []int{1, 2})
+	target, _ := nn.NewTensorFromData([]float32{-1, 0}, []int{1, 2})
+	loss, _, err := CosineSimilarityLoss().Loss(pred, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	if diff := math.Abs(float64(loss - 2.0)); diff > 1e-4 {
+		t.Fatalf("loss = %v, want 2.0 for opposed vectors", loss)
+	}
+}
+
+func TestCosineSimilarityGradient(t *testing.T) {
+	pred, _ := nn.NewTensorFromData([]float32{0.6, -0.4, 0.9, 1.2, 0.3, -0.7}, []int{2, 3})
+	target, _ := nn.NewTensorFromData([]float32{0.2, 0.5, -0.3, -0.1, 0.8, 0.4}, []int{2, 3})
+	checkLossGradient(t, CosineSimilarityLoss(), pred, target)
+}
+
+func TestLabelSmoothingPreservesProbabilityMass(t *testing.T) {
+	logits, _ := nn.NewTensorFromData([]float32{2, 1, 0.1}, []int{1, 3})
+	target, _ := nn.NewTensorFromData([]float32{1, 0, 0}, []int{1, 3})
+	smoothed := LabelSmoothingLoss(CrossEntropy(), 0.1, 3)
+	lossSmoothed, _, err := smoothed.Loss(logits, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	lossPlain, _, err := CrossEntropy().Loss(logits, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	// Smoothing spreads probability mass away from the true class, which
+	// can only increase cross-entropy against a one-hot target.
+	if lossSmoothed <= lossPlain {
+		t.Fatalf("smoothed loss %v should exceed plain CE loss %v", lossSmoothed, lossPlain)
+	}
+}
+
+func TestLabelSmoothingZeroEpsilonMatchesInner(t *testing.T) {
+	logits, _ := nn.NewTensorFromData([]float32{2, 1, 0.1}, []int{1, 3})
+	target, _ := nn.NewTensorFromData([]float32{1, 0, 0}, []int{1, 3})
+	smoothed := LabelSmoothingLoss(CrossEntropy(), 0, 3)
+	lossSmoothed, gradSmoothed, err := smoothed.Loss(logits, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	lossPlain, gradPlain, err := CrossEntropy().Loss(logits, target)
+	if err != nil {
+		t.Fatalf("Loss: %v", err)
+	}
+	if diff := math.Abs(float64(lossSmoothed - lossPlain)); diff > 1e-6 {
+		t.Fatalf("Epsilon=0 loss = %v, want %v (plain CE)", lossSmoothed, lossPlain)
+	}
+	for i := range gradPlain.Data {
+		if diff := math.Abs(float64(gradSmoothed.Data[i] - gradPlain.Data[i])); diff > 1e-6 {
+			t.Errorf("grad[%d] = %v, want %v", i, gradSmoothed.Data[i], gradPlain.Data[i])
+		}
+	}
+}
+
 func TestMAELossGradientSign(t *testing.T) {
 	pred, _ := nn.NewTensorFromData([]float32{5, 1}, []int{2, 1})
 	target, _ := nn.NewTensorFromData([]float32{3, 4}, []int{2, 1})

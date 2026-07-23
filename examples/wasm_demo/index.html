@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NeuGo WASM demo — XOR</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  .row { display: flex; gap: 1rem; align-items: center; margin: 1rem 0; }
+  select { font-size: 1rem; padding: 0.25rem; }
+  button { font-size: 1rem; padding: 0.4rem 1rem; cursor: pointer; }
+  #result { font-size: 1.5rem; font-weight: 600; margin-top: 1rem; }
+  #status { color: #666; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>NeuGo → WASM: XOR model running entirely in your browser</h1>
+<p id="status">Loading predict.wasm…</p>
+
+<div class="row">
+  <label>A: <select id="a"><option>0</option><option>1</option></select></label>
+  <label>B: <select id="b"><option>0</option><option>1</option></select></label>
+  <button id="go" disabled>Predict</button>
+</div>
+<div id="result"></div>
+
+<p>
+This model, its weights, and this browser wrapper were produced entirely
+by <code>examples/wasm_demo/train</code> + <code>export.GenerateGo</code> +
+<code>GOOS=js GOARCH=wasm go build</code> — no server, no Python, no
+network call. See <code>README.md</code> in this directory for the build
+steps.
+</p>
+
+<script src="wasm_exec.js"></script>
+<script>
+const go = new Go();
+WebAssembly.instantiateStreaming(fetch("predict.wasm"), go.importObject).then((result) => {
+  go.run(result.instance);
+  document.getElementById("status").textContent = "Model loaded — ready.";
+  document.getElementById("go").disabled = false;
+}).catch((err) => {
+  document.getElementById("status").textContent = "Failed to load predict.wasm: " + err;
+});
+
+document.getElementById("go").addEventListener("click", () => {
+  const a = parseFloat(document.getElementById("a").value);
+  const b = parseFloat(document.getElementById("b").value);
+  const out = predict(new Float32Array([a, b]));
+  const p = out[0];
+  document.getElementById("result").textContent =
+    `P(XOR=1) = ${p.toFixed(4)}  →  predicted ${p >= 0.5 ? 1 : 0}`;
+});
+</script>
+</body>
+</html>
